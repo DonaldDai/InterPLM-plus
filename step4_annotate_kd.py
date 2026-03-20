@@ -28,10 +28,12 @@ Kyte-Doolittle 标度来源:
 
 用法:
   python step4_annotate_kd.py
+  python step4_annotate_kd.py --flush-every 200
 """
 
 import sys
 import time
+import argparse
 from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple
@@ -52,6 +54,9 @@ OUTPUT_DIR = Path("cusdata/04_kd")
 
 OUTPUT_FILE = OUTPUT_DIR / "kd_per_residue.tsv"
 WARNING_LOG = OUTPUT_DIR / "kd_residue_warnings.tsv"
+
+# 默认每处理多少条序列flush一次 (命令行 --flush-every 可覆盖)
+FLUSH_EVERY = 500
 
 # 未识别残基的哨兵值 (KD标度范围是 -4.5 ~ +4.5, -99 不会与真实值混淆)
 KD_UNKNOWN_SENTINEL = -99
@@ -85,11 +90,11 @@ KD_SCALE = {
 
 # 非标准但已知的残基 → 降级到最接近的标准残基
 KD_SPECIAL = {
-    "U": 2.5,    # Selenocysteine → 按Cys
-    "O": -3.9,   # Pyrrolysine → 按Lys
-    "B": -3.5,   # Asx (Asp或Asn) → 取共同值
-    "Z": -3.5,   # Glx (Glu或Gln) → 取共同值
-    "X": 0.0,    # Unknown → 中性近似
+    "U": -100,    # Selenocysteine → 按Cys
+    "O": -100,   # Pyrrolysine → 按Lys
+    "B": -100,   # Asx (Asp或Asn) → 取共同值
+    "Z": -100,   # Glx (Glu或Gln) → 取共同值
+    "X": -100,    # Unknown → 中性近似
 }
 
 
@@ -117,8 +122,10 @@ class ResidueWarningLogger:
         self.n_unknown = 0
 
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(log_path, "w") as f:
-            f.write(self.HEADER)
+        # append模式: 文件不存在才写header, 已存在直接追加
+        if not log_path.exists() or log_path.stat().st_size == 0:
+            with open(log_path, "w") as f:
+                f.write(self.HEADER)
 
     def log_special(self, uniprot_id: str, position_0based: int, residue: str, kd: float):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -162,8 +169,15 @@ def read_fasta(fasta_path: Path) -> List[Tuple[str, str]]:
 # 主流程
 # ============================================================
 def main():
+    parser = argparse.ArgumentParser(description="Step 4: KD per-residue annotation")
+    parser.add_argument("--flush-every", type=int, default=FLUSH_EVERY,
+                        help=f"每处理N条序列flush一次 (默认: {FLUSH_EVERY})")
+    args = parser.parse_args()
+    flush_every = args.flush_every
+
     print("=" * 60)
     print("Step 4: Kyte-Doolittle per-residue annotation")
+    print(f"  flush-every: {flush_every}")
     print("=" * 60)
 
     if not INPUT_FASTA.exists():
@@ -187,6 +201,7 @@ def main():
     print(f"日志: {WARNING_LOG}")
     t0 = time.time()
     n_residues = 0
+    n_seqs_done = 0
 
     with open(OUTPUT_FILE, "w") as f:
         f.write("uniprot_id\tresidue\tposition\tkd_value\n")
@@ -204,19 +219,36 @@ def main():
                     kd = KD_SPECIAL.get(aa_upper)
                     if kd is not None:
                         logger.log_special(uid, pos, aa_upper, kd)
+                        continue
                     else:
                         kd = KD_UNKNOWN_SENTINEL
                         logger.log_unknown(uid, pos, aa_upper, kd)
+                        continue
 
                 f.write(f"{uid}\t{aa_upper}\t{pos}\t{kd}\n")
                 n_residues += 1
 
+            n_seqs_done += 1
+
+            # 定期flush
+            if n_seqs_done % flush_every == 0:
+                f.flush()
+                logger.flush()
+                elapsed = time.time() - t0
+                rate = n_seqs_done / elapsed if elapsed > 0 else 0
+                print(f"  [{n_seqs_done:>6}/{len(all_sequences)}] "
+                      f"residues={n_residues} "
+                      f"warnings={logger.n_special + logger.n_unknown} "
+                      f"({rate:.0f} seq/s)")
+
+    # 最终flush
     logger.flush()
     elapsed = time.time() - t0
 
     # 摘要
     size_mb = OUTPUT_FILE.stat().st_size / (1024 * 1024)
     print(f"\n完成")
+    print(f"  序列数:     {n_seqs_done}")
     print(f"  残基数:     {n_residues}")
     print(f"  异常残基:   {logger.summary()}")
     print(f"  文件大小:   {size_mb:.1f} MB")
