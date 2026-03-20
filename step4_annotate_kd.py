@@ -10,17 +10,21 @@ Step 4: 逐残基标注 Kyte-Doolittle 疏水性值
   先对全量数据提取所有特征, 后续再统一切分训练/验证集,
   避免先切分后发现某些蛋白缺失某类标注。
 
+KD值说明:
+  标准20种氨基酸: Kyte & Doolittle 原始分值 (-4.5 ~ +4.5)
+  非标准已知残基 (U/O/B/Z/X): 降级到最接近的标准残基分值, 记入日志
+  完全未识别的字符: kd_value = -99 (哨兵值, 下游可过滤), 记入日志
+
 Kyte-Doolittle 标度来源:
   Kyte J, Doolittle RF (1982) "A simple method for displaying the
   hydropathic character of a protein." J Mol Biol 157:105-132.
 
 输入:
-  data/01_raw/uniprot_pdb_sequences.fasta
+  cusdata/01_raw/uniprot_pdb_sequences.fasta
 
 输出:
-  data/04_kd/kd_per_residue.tsv
-  列: uniprot_id  residue  position  kd_value
-  (position 为 0-based UniProt 序列下标)
+  cusdata/04_kd/kd_per_residue.tsv       ← 主输出
+  cusdata/04_kd/kd_residue_warnings.tsv  ← special/unknown 残基日志
 
 用法:
   python step4_annotate_kd.py
@@ -28,6 +32,7 @@ Kyte-Doolittle 标度来源:
 
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple
 
@@ -42,10 +47,14 @@ except ImportError:
 # ============================================================
 # 配置
 # ============================================================
-INPUT_FASTA = Path("data/01_raw/uniprot_pdb_sequences.fasta")
-OUTPUT_DIR = Path("data/04_kd")
+INPUT_FASTA = Path("cusdata/01_raw/uniprot_pdb_sequences.fasta")
+OUTPUT_DIR = Path("cusdata/04_kd")
 
 OUTPUT_FILE = OUTPUT_DIR / "kd_per_residue.tsv"
+WARNING_LOG = OUTPUT_DIR / "kd_residue_warnings.tsv"
+
+# 未识别残基的哨兵值 (KD标度范围是 -4.5 ~ +4.5, -99 不会与真实值混淆)
+KD_UNKNOWN_SENTINEL = -99
 
 # ============================================================
 # Kyte-Doolittle 疏水性标度
@@ -74,14 +83,63 @@ KD_SCALE = {
     "R": -4.5,   # Arginine
 }
 
-# 非标准残基降级处理
+# 非标准但已知的残基 → 降级到最接近的标准残基
 KD_SPECIAL = {
     "U": 2.5,    # Selenocysteine → 按Cys
-    "O": -3.5,   # Pyrrolysine → 按Lys近似
+    "O": -3.9,   # Pyrrolysine → 按Lys
     "B": -3.5,   # Asx (Asp或Asn) → 取共同值
     "Z": -3.5,   # Glx (Glu或Gln) → 取共同值
-    "X": 0.0,    # Unknown → 中性
+    "X": 0.0,    # Unknown → 中性近似
 }
+
+
+# ============================================================
+# 残基警告日志
+# ============================================================
+class ResidueWarningLogger:
+    """
+    记录 special 和 unknown 残基
+
+    日志格式:
+      timestamp  uniprot_id  position_1based  residue  category  kd_value
+
+    category:
+      special  — 非标准但已知 (U/O/B/Z/X), 降级处理
+      unknown  — 完全未识别的字符, kd=-99
+    """
+
+    HEADER = "timestamp\tuniprot_id\tposition_1based\tresidue\tcategory\tkd_value\n"
+
+    def __init__(self, log_path: Path):
+        self.log_path = log_path
+        self._buf: List[str] = []
+        self.n_special = 0
+        self.n_unknown = 0
+
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "w") as f:
+            f.write(self.HEADER)
+
+    def log_special(self, uniprot_id: str, position_0based: int, residue: str, kd: float):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._buf.append(
+            f"{ts}\t{uniprot_id}\t{position_0based + 1}\t{residue}\tspecial\t{kd}\n")
+        self.n_special += 1
+
+    def log_unknown(self, uniprot_id: str, position_0based: int, residue: str, kd: float):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self._buf.append(
+            f"{ts}\t{uniprot_id}\t{position_0based + 1}\t{residue}\tunknown\t{kd}\n")
+        self.n_unknown += 1
+
+    def flush(self):
+        if self._buf:
+            with open(self.log_path, "a") as f:
+                f.writelines(self._buf)
+            self._buf.clear()
+
+    def summary(self) -> str:
+        return f"special={self.n_special}, unknown={self.n_unknown}"
 
 
 # ============================================================
@@ -90,11 +148,6 @@ KD_SPECIAL = {
 def read_fasta(fasta_path: Path) -> List[Tuple[str, str]]:
     """
     用 BioPython SeqIO 读取FASTA, 返回 [(uniprot_id, sequence), ...]
-
-    SeqIO 解析后的 record:
-      record.id   = "sp|P12345|PROT_HUMAN"  (到第一个空格)
-      record.seq  = Seq("MAKLI...")
-    
     从 record.id 中提取 UniProt accession (第二个 | 分隔字段)
     """
     sequences = []
@@ -126,13 +179,14 @@ def main():
     total_residues = sum(len(seq) for _, seq in all_sequences)
     print(f"  残基数: {total_residues}")
 
-    # 标注并写入
+    # 初始化
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    logger = ResidueWarningLogger(WARNING_LOG)
 
     print(f"\n写入: {OUTPUT_FILE}")
+    print(f"日志: {WARNING_LOG}")
     t0 = time.time()
     n_residues = 0
-    n_unknown = 0
 
     with open(OUTPUT_FILE, "w") as f:
         f.write("uniprot_id\tresidue\tposition\tkd_value\n")
@@ -141,25 +195,38 @@ def main():
             for pos, aa in enumerate(seq):
                 aa_upper = aa.upper()
 
+                # 查表: 标准20种 → special → unknown
                 kd = KD_SCALE.get(aa_upper)
-                if kd is None:
+
+                if kd is not None:
+                    pass
+                else:
                     kd = KD_SPECIAL.get(aa_upper)
-                if kd is None:
-                    kd = 0.0
-                    n_unknown += 1
+                    if kd is not None:
+                        logger.log_special(uid, pos, aa_upper, kd)
+                    else:
+                        kd = KD_UNKNOWN_SENTINEL
+                        logger.log_unknown(uid, pos, aa_upper, kd)
 
                 f.write(f"{uid}\t{aa_upper}\t{pos}\t{kd}\n")
                 n_residues += 1
 
+    logger.flush()
     elapsed = time.time() - t0
 
     # 摘要
     size_mb = OUTPUT_FILE.stat().st_size / (1024 * 1024)
     print(f"\n完成")
     print(f"  残基数:     {n_residues}")
-    print(f"  未识别残基: {n_unknown}")
+    print(f"  异常残基:   {logger.summary()}")
     print(f"  文件大小:   {size_mb:.1f} MB")
     print(f"  耗时:       {elapsed:.1f}s")
+
+    if logger.n_special > 0 or logger.n_unknown > 0:
+        log_size = WARNING_LOG.stat().st_size / 1024
+        print(f"\n警告日志: {WARNING_LOG} ({log_size:.1f} KB)")
+        print(f"  special (降级处理): {logger.n_special}")
+        print(f"  unknown (kd={KD_UNKNOWN_SENTINEL}): {logger.n_unknown}")
 
 
 if __name__ == "__main__":
