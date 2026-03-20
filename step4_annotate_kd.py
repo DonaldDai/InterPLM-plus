@@ -15,10 +15,10 @@ Kyte-Doolittle 标度来源:
   hydropathic character of a protein." J Mol Biol 157:105-132.
 
 输入:
-  cusdata/01_raw/uniprot_pdb_sequences.fasta
+  data/01_raw/uniprot_pdb_sequences.fasta
 
 输出:
-  cusdata/04_kd/kd_per_residue.tsv
+  data/04_kd/kd_per_residue.tsv
   列: uniprot_id  residue  position  kd_value
   (position 为 0-based UniProt 序列下标)
 
@@ -29,14 +29,21 @@ Kyte-Doolittle 标度来源:
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import List, Tuple
+
+try:
+    from Bio import SeqIO
+except ImportError:
+    print("ERROR: biopython 未安装")
+    print("安装: pip install biopython")
+    sys.exit(1)
 
 
 # ============================================================
 # 配置
 # ============================================================
-INPUT_FASTA = Path("cusdata/01_raw/uniprot_pdb_sequences.fasta")
-OUTPUT_DIR = Path("cusdata/04_kd")
+INPUT_FASTA = Path("data/01_raw/uniprot_pdb_sequences.fasta")
+OUTPUT_DIR = Path("data/04_kd")
 
 OUTPUT_FILE = OUTPUT_DIR / "kd_per_residue.tsv"
 
@@ -78,35 +85,23 @@ KD_SPECIAL = {
 
 
 # ============================================================
-# 读取 FASTA
+# 读取 FASTA (BioPython SeqIO)
 # ============================================================
 def read_fasta(fasta_path: Path) -> List[Tuple[str, str]]:
     """
-    读取FASTA, 返回 [(uniprot_id, sequence), ...]
+    用 BioPython SeqIO 读取FASTA, 返回 [(uniprot_id, sequence), ...]
 
-    header格式: >sp|P12345|PROT_HUMAN ...
-    提取 accession = P12345
+    SeqIO 解析后的 record:
+      record.id   = "sp|P12345|PROT_HUMAN"  (到第一个空格)
+      record.seq  = Seq("MAKLI...")
+    
+    从 record.id 中提取 UniProt accession (第二个 | 分隔字段)
     """
     sequences = []
-    current_id = None
-    current_seq = []
-
-    with open(fasta_path) as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith(">"):
-                if current_id is not None:
-                    sequences.append((current_id, "".join(current_seq)))
-                header = line[1:].split()[0]
-                parts = header.split("|")
-                current_id = parts[1] if len(parts) >= 2 else header
-                current_seq = []
-            elif line:
-                current_seq.append(line)
-
-        if current_id is not None:
-            sequences.append((current_id, "".join(current_seq)))
-
+    for record in SeqIO.parse(str(fasta_path), "fasta"):
+        parts = record.id.split("|")
+        uid = parts[1] if len(parts) >= 2 else record.id
+        sequences.append((uid, str(record.seq)))
     return sequences
 
 
