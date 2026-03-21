@@ -13,7 +13,7 @@ Step 7: 筛选最能表征疏水性特征的 SAE activation 序号
   5. 在 validation 集上计算 top-N features 的 F1
 
 依赖:
-  pip install interplm torch h5py numpy biopython
+  pip install interplm torch h5py numpy biopython matplotlib
 
 输入:
   cusdata/06_splits/kd_refer.tsv
@@ -21,15 +21,18 @@ Step 7: 筛选最能表征疏水性特征的 SAE activation 序号
   cusdata/esm_cache/{model}/layer_{L}/embeddings.h5
 
 输出:
-  cusdata/07_sae_features/
-  ├── refer_f1_all.tsv         ← 所有 SAE feature 在 refer 集的 F1 及 TP/FP/FN
-  ├── top_features.tsv         ← 选出的 top-N feature 序号及 F1
-  ├── val_f1_top.tsv           ← top-N feature 在 validation 集的 F1
-  └── step7_log.tsv            ← 全流程日志
+  cusdata/07_sae_features/{feature_name}/
+  ├── refer_f1_all.tsv              ← 全部 feature 的 F1 (按 feature_idx 顺序)
+  ├── refer_f1_sorted.tsv           ← 全部 feature 的 F1 (按 F1 降序)
+  ├── refer_f1_distribution.png     ← F1 分布直方图
+  ├── top_features.tsv              ← 选出的 top-N feature 序号及 F1
+  ├── val_f1_top.tsv                ← top-N feature 在 validation 集的 F1
+  └── step7_log.tsv                 ← 全流程日志
 
 用法:
   python step7_select_sae_features.py
-  python step7_select_sae_features.py --top-n 20 --kd-threshold 1.8 --sae-threshold 0.5
+  python step7_select_sae_features.py --feature-name kd_hydrophobic --top-n 20
+  python step7_select_sae_features.py --feature-name buried_residue --kd-threshold 0.25
 """
 
 import sys
@@ -42,6 +45,14 @@ from collections import defaultdict
 from typing import Dict, List, Set, Tuple, Optional
 
 import numpy as np
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # 非交互式后端
+    import matplotlib.pyplot as plt
+except ImportError:
+    print("WARNING: matplotlib 未安装, 将跳过直方图生成")
+    plt = None
 
 try:
     import torch
@@ -65,15 +76,16 @@ except ImportError:
 KD_REFER = Path("cusdata/06_splits/kd_refer.tsv")
 KD_VAL = Path("cusdata/06_splits/kd_val.tsv")
 EMB_CACHE = Path("cusdata/esm_cache")
-OUTPUT_DIR = Path("cusdata/07_sae_features")
+OUTPUT_BASE = Path("cusdata/07_sae_features")
 
 # 默认超参
-DEFAULT_TOP_N = 10
+DEFAULT_TOP_N = 20
 DEFAULT_KD_THRESHOLD = 1.8       # KD >= 1.8 → hydrophobic (I,V,L,F,C,M,A)
 DEFAULT_SAE_THRESHOLD = 0.5      # SAE activation >= 0.5 → active
 DEFAULT_PLM_MODEL = "esm2-8m"
 DEFAULT_PLM_LAYER = 4
-DEFAULT_BATCH_SIZE = 64          # 每次从缓存加载的蛋白数
+DEFAULT_BATCH_SIZE = 64
+DEFAULT_FEATURE_NAME = "kd_hydrophobic"  # 特征名, 用作输出子目录
 
 
 # ============================================================
@@ -246,6 +258,8 @@ def compute_f1(tp: np.ndarray, fp: np.ndarray, fn: np.ndarray
 def main():
     parser = argparse.ArgumentParser(
         description="Step 7: 筛选最佳 SAE features for KD hydrophobicity")
+    parser.add_argument("--feature-name", type=str, default=DEFAULT_FEATURE_NAME,
+                        help=f"特征名称, 用作输出子目录 (默认: {DEFAULT_FEATURE_NAME})")
     parser.add_argument("--top-n", type=int, default=DEFAULT_TOP_N,
                         help=f"选出的 feature 数量 (默认: {DEFAULT_TOP_N})")
     parser.add_argument("--kd-threshold", type=float, default=DEFAULT_KD_THRESHOLD,
@@ -265,6 +279,9 @@ def main():
     else:
         device = args.device
 
+    # 输出目录: cusdata/07_sae_features/{feature_name}/
+    OUTPUT_DIR = OUTPUT_BASE / args.feature_name
+
     # 推断 embedding 缓存路径
     model_map = {
         "esm2-8m": "t6_8M",
@@ -276,6 +293,7 @@ def main():
     print("=" * 60)
     print("Step 7: SAE Feature Selection for KD Hydrophobicity")
     print("=" * 60)
+    print(f"  feature_name:   {args.feature_name}")
     print(f"  top_n:          {args.top_n}")
     print(f"  kd_threshold:   {args.kd_threshold}")
     print(f"  sae_threshold:  {args.sae_threshold}")
@@ -283,6 +301,7 @@ def main():
     print(f"  plm_layer:      {args.plm_layer}")
     print(f"  device:         {device}")
     print(f"  embedding:      {h5_path}")
+    print(f"  output:         {OUTPUT_DIR}")
 
     # 检查输入
     for fp, name in [(KD_REFER, "refer KD"), (KD_VAL, "val KD"),
@@ -295,6 +314,7 @@ def main():
     logger = StepLogger(OUTPUT_DIR / "step7_log.tsv")
 
     logger.log("main", "start",
+               f"feature_name={args.feature_name}, "
                f"top_n={args.top_n}, kd_thresh={args.kd_threshold}, "
                f"sae_thresh={args.sae_threshold}, model={args.plm_model}, "
                f"layer={args.plm_layer}")
@@ -339,7 +359,7 @@ def main():
 
     f1_r, prec_r, rec_r = compute_f1(tp_r, fp_r, fn_r)
 
-    # 保存全量 refer F1
+    # 保存全量 refer F1 (按 feature_idx 顺序)
     refer_f1_file = OUTPUT_DIR / "refer_f1_all.tsv"
     with open(refer_f1_file, "w") as f:
         f.write("feature_idx\tf1\tprecision\trecall\ttp\tfp\tfn\n")
@@ -347,6 +367,38 @@ def main():
             f.write(f"{i}\t{f1_r[i]:.6f}\t{prec_r[i]:.6f}\t{rec_r[i]:.6f}\t"
                     f"{tp_r[i]}\t{fp_r[i]}\t{fn_r[i]}\n")
     logger.log("7.3_refer", "saved", f"file={refer_f1_file}")
+
+    # 保存按 F1 降序排列的版本
+    refer_f1_sorted_file = OUTPUT_DIR / "refer_f1_sorted.tsv"
+    sorted_indices = np.argsort(f1_r)[::-1]
+    with open(refer_f1_sorted_file, "w") as f:
+        f.write("rank\tfeature_idx\tf1\tprecision\trecall\ttp\tfp\tfn\n")
+        for rank, i in enumerate(sorted_indices):
+            f.write(f"{rank + 1}\t{i}\t{f1_r[i]:.6f}\t{prec_r[i]:.6f}\t{rec_r[i]:.6f}\t"
+                    f"{tp_r[i]}\t{fp_r[i]}\t{fn_r[i]}\n")
+    logger.log("7.3_refer", "saved_sorted", f"file={refer_f1_sorted_file}")
+
+    # 绘制 F1 分布直方图 (纵轴=F1, 横轴=feature下标)
+    hist_file = OUTPUT_DIR / "refer_f1_distribution.png"
+    if plt is not None:
+        fig, ax = plt.subplots(figsize=(14, 5))
+        ax.bar(range(n_features), f1_r, width=1.0, color="#4C72B0", alpha=0.8)
+        ax.set_xlabel("Feature Index", fontsize=12)
+        ax.set_ylabel("F1 Score", fontsize=12)
+        ax.set_title(f"Refer Set F1 per SAE Feature ({args.feature_name})", fontsize=14)
+        ax.set_xlim(-0.5, n_features - 0.5)
+        ax.set_ylim(0, min(1.0, f1_r.max() * 1.15) if f1_r.max() > 0 else 1.0)
+        ax.axhline(y=f1_r[f1_r > 0].mean() if (f1_r > 0).any() else 0,
+                   color="red", linestyle="--", linewidth=0.8,
+                   label=f"mean(nonzero)={f1_r[f1_r > 0].mean():.4f}" if (f1_r > 0).any() else "")
+        ax.legend(fontsize=10)
+        fig.tight_layout()
+        fig.savefig(hist_file, dpi=150)
+        plt.close(fig)
+        logger.log("7.3_refer", "histogram", f"file={hist_file}")
+        print(f"  直方图: {hist_file}")
+    else:
+        logger.log("7.3_refer", "histogram_skip", "matplotlib not installed")
 
     # 统计 refer F1 分布
     f1_nonzero = f1_r[f1_r > 0]
@@ -425,7 +477,8 @@ def main():
               f"{f1_v[local_i]:<12.4f}{delta:<+10.4f}")
     print(f"\n  耗时: {elapsed_total:.1f}s")
     print(f"\n输出文件:")
-    for fp in [refer_f1_file, top_file, val_f1_file, OUTPUT_DIR / "step7_log.tsv"]:
+    for fp in [refer_f1_file, refer_f1_sorted_file, hist_file,
+               top_file, val_f1_file, OUTPUT_DIR / "step7_log.tsv"]:
         if fp.exists():
             sz = fp.stat().st_size / 1024
             print(f"  {fp} ({sz:.1f} KB)")
