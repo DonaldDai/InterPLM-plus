@@ -1,0 +1,435 @@
+"""
+Step 7: 筛选最能表征疏水性特征的 SAE activation 序号
+===================================================
+
+用 refer 集评估每个 SAE feature 与 KD 疏水性标签的 F1 分数,
+选出 top-N 最佳 feature, 然后在 validation 集上验证。
+
+流程:
+  1. 读取 refer 集 KD 标注, 按阈值二值化 (hydrophobic=1 / non-hydrophobic=0)
+  2. 逐蛋白从 ESM embedding 缓存取 embedding → SAE encode → 按阈值二值化
+  3. 逐残基对比 SAE activation vs KD label, 累积 TP/FP/FN
+  4. 计算每个 SAE feature 的 F1, 选出 top-N
+  5. 在 validation 集上计算 top-N features 的 F1
+
+依赖:
+  pip install interplm torch h5py numpy biopython
+
+输入:
+  cusdata/06_splits/kd_refer.tsv
+  cusdata/06_splits/kd_val.tsv
+  cusdata/esm_cache/{model}/layer_{L}/embeddings.h5
+
+输出:
+  cusdata/07_sae_features/
+  ├── refer_f1_all.tsv         ← 所有 SAE feature 在 refer 集的 F1 及 TP/FP/FN
+  ├── top_features.tsv         ← 选出的 top-N feature 序号及 F1
+  ├── val_f1_top.tsv           ← top-N feature 在 validation 集的 F1
+  └── step7_log.tsv            ← 全流程日志
+
+用法:
+  python step7_select_sae_features.py
+  python step7_select_sae_features.py --top-n 20 --kd-threshold 1.8 --sae-threshold 0.5
+"""
+
+import sys
+import time
+import argparse
+import json
+from datetime import datetime
+from pathlib import Path
+from collections import defaultdict
+from typing import Dict, List, Set, Tuple, Optional
+
+import numpy as np
+
+try:
+    import torch
+    import h5py
+except ImportError as e:
+    print(f"ERROR: {e}")
+    print("安装: pip install torch h5py")
+    sys.exit(1)
+
+try:
+    from interplm.sae.inference import load_sae_from_hf
+except ImportError:
+    print("ERROR: interplm 未安装")
+    print("安装: cd interPLM && pip install -e .")
+    sys.exit(1)
+
+
+# ============================================================
+# 配置
+# ============================================================
+KD_REFER = Path("cusdata/06_splits/kd_refer.tsv")
+KD_VAL = Path("cusdata/06_splits/kd_val.tsv")
+EMB_CACHE = Path("cusdata/esm_cache")
+OUTPUT_DIR = Path("cusdata/07_sae_features")
+
+# 默认超参
+DEFAULT_TOP_N = 10
+DEFAULT_KD_THRESHOLD = 1.8       # KD >= 1.8 → hydrophobic (I,V,L,F,C,M,A)
+DEFAULT_SAE_THRESHOLD = 0.5      # SAE activation >= 0.5 → active
+DEFAULT_PLM_MODEL = "esm2-8m"
+DEFAULT_PLM_LAYER = 4
+DEFAULT_BATCH_SIZE = 64          # 每次从缓存加载的蛋白数
+
+
+# ============================================================
+# 日志
+# ============================================================
+class StepLogger:
+    HEADER = "timestamp\tstep\tstatus\tdetail\n"
+
+    def __init__(self, log_path: Path):
+        self.log_path = log_path
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        if not log_path.exists() or log_path.stat().st_size == 0:
+            with open(log_path, "w") as f:
+                f.write(self.HEADER)
+
+    def log(self, step: str, status: str, detail: str = ""):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{ts}\t{step}\t{status}\t{detail}\n"
+        with open(self.log_path, "a") as f:
+            f.write(line)
+        print(f"  [{ts}] {step}: {status}" + (f" | {detail}" if detail else ""))
+
+
+# ============================================================
+# 1. 读取 KD 标注, 按 uniprot_id 分组
+# ============================================================
+def load_kd_data(kd_path: Path, kd_threshold: float
+                 ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    """
+    返回 {uniprot_id: (positions, binary_labels)}
+      positions:     np.array of int, 0-based 残基位置
+      binary_labels: np.array of int (0 or 1), KD >= threshold → 1
+    """
+    data = defaultdict(lambda: ([], []))
+
+    with open(kd_path) as f:
+        header = f.readline()
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) < 4:
+                continue
+            uid = parts[0]
+            pos = int(parts[2])
+            kd = float(parts[3])
+            label = 1 if kd >= kd_threshold else 0
+            data[uid][0].append(pos)
+            data[uid][1].append(label)
+
+    result = {}
+    for uid, (positions, labels) in data.items():
+        result[uid] = (np.array(positions, dtype=np.int64),
+                       np.array(labels, dtype=np.int64))
+    return result
+
+
+# ============================================================
+# 2. 逐蛋白评估: 累积 TP/FP/FN
+# ============================================================
+def evaluate_on_dataset(
+    kd_data: Dict[str, Tuple[np.ndarray, np.ndarray]],
+    h5_path: Path,
+    sae,
+    sae_threshold: float,
+    device: str,
+    n_features: int,
+    logger: StepLogger,
+    dataset_name: str,
+    feature_subset: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    遍历 dataset 中每个蛋白:
+      1. 从 h5 取 embedding
+      2. SAE encode → 二值化
+      3. 与 KD binary label 对比, 累积 TP/FP/FN
+
+    参数:
+      feature_subset: 如果指定, 只评估这些 feature 序号 (用于 val 集)
+
+    返回:
+      (tp, fp, fn) 各为 shape (n_eval_features,) 的 int64 数组
+    """
+    if feature_subset is not None:
+        n_eval = len(feature_subset)
+    else:
+        n_eval = n_features
+
+    tp = np.zeros(n_eval, dtype=np.int64)
+    fp = np.zeros(n_eval, dtype=np.int64)
+    fn = np.zeros(n_eval, dtype=np.int64)
+
+    n_proteins = 0
+    n_skipped = 0
+    n_residues_total = 0
+
+    with h5py.File(h5_path, "r") as h5f:
+        sorted_uids = sorted(kd_data.keys())
+
+        for uid in sorted_uids:
+            if uid not in h5f:
+                n_skipped += 1
+                continue
+
+            positions, kd_labels = kd_data[uid]
+            emb = h5f[uid][:]  # (seq_len, embed_dim)
+
+            # 检查位置范围
+            valid_mask = positions < emb.shape[0]
+            if not valid_mask.all():
+                positions = positions[valid_mask]
+                kd_labels = kd_labels[valid_mask]
+
+            if len(positions) == 0:
+                n_skipped += 1
+                continue
+
+            # SAE encode
+            emb_tensor = torch.from_numpy(emb).float().to(device)
+            with torch.no_grad():
+                activations = sae.encode(emb_tensor)  # (seq_len, n_features)
+            act_np = activations.cpu().numpy()
+
+            # 取对应位置的 activation
+            act_at_pos = act_np[positions, :]  # (n_residues, n_features)
+
+            # 如果只评估子集
+            if feature_subset is not None:
+                act_at_pos = act_at_pos[:, feature_subset]
+
+            # 二值化 SAE activation
+            pred = (act_at_pos >= sae_threshold).astype(np.int64)  # (n_residues, n_eval)
+            truth = kd_labels[:, np.newaxis]  # (n_residues, 1) broadcast
+
+            # 累积
+            tp += ((pred == 1) & (truth == 1)).sum(axis=0)
+            fp += ((pred == 1) & (truth == 0)).sum(axis=0)
+            fn += ((pred == 0) & (truth == 1)).sum(axis=0)
+
+            n_proteins += 1
+            n_residues_total += len(positions)
+
+            if n_proteins % 500 == 0:
+                logger.log(f"7_{dataset_name}", "progress",
+                           f"proteins={n_proteins}, residues={n_residues_total}")
+
+    logger.log(f"7_{dataset_name}", "done",
+               f"proteins={n_proteins}, skipped={n_skipped}, "
+               f"residues={n_residues_total}")
+
+    return tp, fp, fn
+
+
+# ============================================================
+# 3. 从 TP/FP/FN 计算 F1
+# ============================================================
+def compute_f1(tp: np.ndarray, fp: np.ndarray, fn: np.ndarray
+               ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    返回 (f1, precision, recall) 各为 float64 数组
+    """
+    precision = np.where(tp + fp > 0, tp / (tp + fp), 0.0)
+    recall = np.where(tp + fn > 0, tp / (tp + fn), 0.0)
+    f1 = np.where(precision + recall > 0,
+                  2 * precision * recall / (precision + recall), 0.0)
+    return f1, precision, recall
+
+
+# ============================================================
+# 主流程
+# ============================================================
+def main():
+    parser = argparse.ArgumentParser(
+        description="Step 7: 筛选最佳 SAE features for KD hydrophobicity")
+    parser.add_argument("--top-n", type=int, default=DEFAULT_TOP_N,
+                        help=f"选出的 feature 数量 (默认: {DEFAULT_TOP_N})")
+    parser.add_argument("--kd-threshold", type=float, default=DEFAULT_KD_THRESHOLD,
+                        help=f"KD 二值化阈值 (默认: {DEFAULT_KD_THRESHOLD})")
+    parser.add_argument("--sae-threshold", type=float, default=DEFAULT_SAE_THRESHOLD,
+                        help=f"SAE activation 二值化阈值 (默认: {DEFAULT_SAE_THRESHOLD})")
+    parser.add_argument("--plm-model", type=str, default=DEFAULT_PLM_MODEL,
+                        help=f"InterPLM 模型名 (默认: {DEFAULT_PLM_MODEL})")
+    parser.add_argument("--plm-layer", type=int, default=DEFAULT_PLM_LAYER,
+                        help=f"PLM 层号 (默认: {DEFAULT_PLM_LAYER})")
+    parser.add_argument("--device", type=str, default=None,
+                        help="设备 (默认: 自动)")
+    args = parser.parse_args()
+
+    if args.device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = args.device
+
+    # 推断 embedding 缓存路径
+    model_map = {
+        "esm2-8m": "t6_8M",
+        "esm2-650m": "t33_650M",
+    }
+    cache_short = model_map.get(args.plm_model, args.plm_model)
+    h5_path = EMB_CACHE / cache_short / f"layer_{args.plm_layer}" / "embeddings.h5"
+
+    print("=" * 60)
+    print("Step 7: SAE Feature Selection for KD Hydrophobicity")
+    print("=" * 60)
+    print(f"  top_n:          {args.top_n}")
+    print(f"  kd_threshold:   {args.kd_threshold}")
+    print(f"  sae_threshold:  {args.sae_threshold}")
+    print(f"  plm_model:      {args.plm_model}")
+    print(f"  plm_layer:      {args.plm_layer}")
+    print(f"  device:         {device}")
+    print(f"  embedding:      {h5_path}")
+
+    # 检查输入
+    for fp, name in [(KD_REFER, "refer KD"), (KD_VAL, "val KD"),
+                     (h5_path, "embedding cache")]:
+        if not fp.exists():
+            print(f"\nERROR: {name} 不存在: {fp}")
+            return
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    logger = StepLogger(OUTPUT_DIR / "step7_log.tsv")
+
+    logger.log("main", "start",
+               f"top_n={args.top_n}, kd_thresh={args.kd_threshold}, "
+               f"sae_thresh={args.sae_threshold}, model={args.plm_model}, "
+               f"layer={args.plm_layer}")
+    t0 = time.time()
+
+    # ---- 7.1 读取 refer 集 ----
+    print("\n--- 7.1 读取 refer 集 ---")
+    refer_data = load_kd_data(KD_REFER, args.kd_threshold)
+    n_refer_pos = sum(labels.sum() for _, labels in refer_data.values())
+    n_refer_neg = sum(len(labels) - labels.sum() for _, labels in refer_data.values())
+    logger.log("7.1_load", "refer",
+               f"proteins={len(refer_data)}, "
+               f"positive={n_refer_pos}, negative={n_refer_neg}")
+
+    # ---- 7.2 加载 SAE ----
+    print("\n--- 7.2 加载 SAE ---")
+    logger.log("7.2_sae", "loading",
+               f"model={args.plm_model}, layer={args.plm_layer}")
+    sae = load_sae_from_hf(
+        plm_model=args.plm_model, plm_layer=args.plm_layer
+    ).to(device)
+    sae.eval()
+
+    # 获取 feature 数量
+    # SAE encode 一个 dummy input 来确定 n_features
+    with h5py.File(h5_path, "r") as f:
+        for key in f:
+            dummy_emb = f[key][:1, :]  # (1, embed_dim)
+            break
+    dummy_tensor = torch.from_numpy(dummy_emb).float().to(device)
+    with torch.no_grad():
+        dummy_act = sae.encode(dummy_tensor)
+    n_features = dummy_act.shape[1]
+    logger.log("7.2_sae", "loaded", f"n_features={n_features}")
+    print(f"  SAE features: {n_features}")
+
+    # ---- 7.3 Refer 集评估 ----
+    print("\n--- 7.3 评估 refer 集 (全部 features) ---")
+    tp_r, fp_r, fn_r = evaluate_on_dataset(
+        refer_data, h5_path, sae, args.sae_threshold,
+        device, n_features, logger, "refer")
+
+    f1_r, prec_r, rec_r = compute_f1(tp_r, fp_r, fn_r)
+
+    # 保存全量 refer F1
+    refer_f1_file = OUTPUT_DIR / "refer_f1_all.tsv"
+    with open(refer_f1_file, "w") as f:
+        f.write("feature_idx\tf1\tprecision\trecall\ttp\tfp\tfn\n")
+        for i in range(n_features):
+            f.write(f"{i}\t{f1_r[i]:.6f}\t{prec_r[i]:.6f}\t{rec_r[i]:.6f}\t"
+                    f"{tp_r[i]}\t{fp_r[i]}\t{fn_r[i]}\n")
+    logger.log("7.3_refer", "saved", f"file={refer_f1_file}")
+
+    # 统计 refer F1 分布
+    f1_nonzero = f1_r[f1_r > 0]
+    logger.log("7.3_refer", "f1_stats",
+               f"max={f1_r.max():.4f}, "
+               f"mean_nonzero={f1_nonzero.mean():.4f if len(f1_nonzero) > 0 else 0:.4f}, "
+               f"n_nonzero={len(f1_nonzero)}/{n_features}")
+
+    # ---- 7.4 选出 top-N ----
+    print(f"\n--- 7.4 选出 top-{args.top_n} features ---")
+    top_indices = np.argsort(f1_r)[::-1][:args.top_n]
+
+    top_file = OUTPUT_DIR / "top_features.tsv"
+    with open(top_file, "w") as f:
+        f.write("rank\tfeature_idx\tf1_refer\tprecision\trecall\ttp\tfp\tfn\n")
+        for rank, idx in enumerate(top_indices):
+            f.write(f"{rank + 1}\t{idx}\t{f1_r[idx]:.6f}\t"
+                    f"{prec_r[idx]:.6f}\t{rec_r[idx]:.6f}\t"
+                    f"{tp_r[idx]}\t{fp_r[idx]}\t{fn_r[idx]}\n")
+            logger.log("7.4_topN", "selected",
+                       f"rank={rank + 1}, feature={idx}, "
+                       f"f1={f1_r[idx]:.4f}, prec={prec_r[idx]:.4f}, "
+                       f"rec={rec_r[idx]:.4f}")
+    logger.log("7.4_topN", "saved", f"file={top_file}")
+
+    print(f"  Top-{args.top_n} F1 range: "
+          f"{f1_r[top_indices[-1]]:.4f} ~ {f1_r[top_indices[0]]:.4f}")
+
+    # ---- 7.5 Validation 集评估 (仅 top-N) ----
+    print(f"\n--- 7.5 评估 validation 集 (top-{args.top_n} features) ---")
+    val_data = load_kd_data(KD_VAL, args.kd_threshold)
+    n_val_pos = sum(labels.sum() for _, labels in val_data.values())
+    n_val_neg = sum(len(labels) - labels.sum() for _, labels in val_data.values())
+    logger.log("7.5_val", "loaded",
+               f"proteins={len(val_data)}, "
+               f"positive={n_val_pos}, negative={n_val_neg}")
+
+    tp_v, fp_v, fn_v = evaluate_on_dataset(
+        val_data, h5_path, sae, args.sae_threshold,
+        device, n_features, logger, "val",
+        feature_subset=top_indices)
+
+    f1_v, prec_v, rec_v = compute_f1(tp_v, fp_v, fn_v)
+
+    val_f1_file = OUTPUT_DIR / "val_f1_top.tsv"
+    with open(val_f1_file, "w") as f:
+        f.write("rank\tfeature_idx\tf1_refer\tf1_val\t"
+                "prec_val\trecall_val\ttp_val\tfp_val\tfn_val\n")
+        for rank, (idx, local_i) in enumerate(zip(top_indices, range(len(top_indices)))):
+            f.write(f"{rank + 1}\t{idx}\t{f1_r[idx]:.6f}\t{f1_v[local_i]:.6f}\t"
+                    f"{prec_v[local_i]:.6f}\t{rec_v[local_i]:.6f}\t"
+                    f"{tp_v[local_i]}\t{fp_v[local_i]}\t{fn_v[local_i]}\n")
+            logger.log("7.5_val", "feature",
+                       f"rank={rank + 1}, feature={idx}, "
+                       f"f1_refer={f1_r[idx]:.4f}, f1_val={f1_v[local_i]:.4f}, "
+                       f"delta={f1_v[local_i] - f1_r[idx]:+.4f}")
+    logger.log("7.5_val", "saved", f"file={val_f1_file}")
+
+    elapsed_total = time.time() - t0
+    logger.log("main", "done", f"elapsed={elapsed_total:.1f}s")
+
+    # ---- 摘要 ----
+    print()
+    print("=" * 60)
+    print("完成")
+    print("=" * 60)
+    print(f"  SAE features:   {n_features}")
+    print(f"  Refer集:        {len(refer_data)} proteins")
+    print(f"  Val集:          {len(val_data)} proteins")
+    print(f"  Top-{args.top_n} 结果:")
+    print(f"  {'Rank':<6}{'Feature':<10}{'F1(refer)':<12}{'F1(val)':<12}{'Delta':<10}")
+    print(f"  {'-'*48}")
+    for rank, (idx, local_i) in enumerate(zip(top_indices, range(len(top_indices)))):
+        delta = f1_v[local_i] - f1_r[idx]
+        print(f"  {rank + 1:<6}{idx:<10}{f1_r[idx]:<12.4f}"
+              f"{f1_v[local_i]:<12.4f}{delta:<+10.4f}")
+    print(f"\n  耗时: {elapsed_total:.1f}s")
+    print(f"\n输出文件:")
+    for fp in [refer_f1_file, top_file, val_f1_file, OUTPUT_DIR / "step7_log.tsv"]:
+        if fp.exists():
+            sz = fp.stat().st_size / 1024
+            print(f"  {fp} ({sz:.1f} KB)")
+
+
+if __name__ == "__main__":
+    main()
