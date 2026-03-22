@@ -6,8 +6,8 @@ Step 7: 筛选最能表征生物特征的 SAE activation 序号
 选出 top-N 最佳 feature, 在 validation 集上验证, 并计算累计 F1。
 
 支持的特征源 (通过 --feature-source 指定):
-  kd:  KD疏水性 (value_col=3, >=1.8 → positive)
-  rsa: 溶剂可及性 (value_col=5, <0.25 → positive/buried)
+  kd:  KD疏水性 (col="kd_value", >=1.8 → positive)
+  rsa: 溶剂可及性 (col="rsa", <0.25 → positive/buried)
 
 流程:
   1. 读取 refer 集标注, 按阈值二值化
@@ -80,16 +80,16 @@ FEATURE_REGISTRY = {
     "kd": {
         "refer": Path("cusdata/06_splits/kd/refer.tsv"),
         "val":   Path("cusdata/06_splits/kd/val.tsv"),
-        "value_col": 3,           # kd_value
-        "default_threshold": 1.8, # KD >= 1.8 → hydrophobic
-        "positive_above": True,   # >= threshold → positive
+        "value_col_name": "kd_value",   # 列名
+        "default_threshold": 1.8,
+        "positive_above": True,
     },
     "rsa": {
         "refer": Path("cusdata/06_splits/rsa/refer.tsv"),
         "val":   Path("cusdata/06_splits/rsa/val.tsv"),
-        "value_col": 5,           # rsa
-        "default_threshold": 0.25,# RSA < 0.25 → buried
-        "positive_above": False,  # < threshold → positive
+        "value_col_name": "rsa",        # 列名
+        "default_threshold": 0.25,
+        "positive_above": False,
     },
 }
 
@@ -99,8 +99,8 @@ DEFAULT_SAE_THRESHOLD = 0.5      # SAE activation >= 0.5 → active
 DEFAULT_PLM_MODEL = "esm2-8m"
 DEFAULT_PLM_LAYER = 4
 DEFAULT_BATCH_SIZE = 64
-DEFAULT_FEATURE_NAME = "kd_hydrophobic"
-DEFAULT_FEATURE_SOURCE = "kd"    # FEATURE_REGISTRY 中的 key
+DEFAULT_FEATURE_NAME = "rsa_hydrophobic"
+DEFAULT_FEATURE_SOURCE = "rsa"    # FEATURE_REGISTRY 中的 key
 
 
 # ============================================================
@@ -129,13 +129,13 @@ class StepLogger:
 # ============================================================
 def load_feature_data(
     data_path: Path,
-    value_col: int,
+    value_col_name: str,
     threshold: float,
     positive_above: bool,
 ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
     """
     返回 {uniprot_id: (positions, binary_labels)}
-      positions:     np.array of int, 0-based 残基位置 (列2)
+      positions:     np.array of int, 0-based 残基位置 (列名 "position")
       binary_labels: np.array of int (0 or 1)
         positive_above=True:  value >= threshold → 1
         positive_above=False: value < threshold  → 1
@@ -143,13 +143,20 @@ def load_feature_data(
     data = defaultdict(lambda: ([], []))
 
     with open(data_path) as f:
-        header = f.readline()
+        header = f.readline().strip().split("\t")
+        # 按列名查找索引
+        if value_col_name not in header:
+            raise ValueError(
+                f"列名 '{value_col_name}' 不在 {data_path} 的 header 中: {header}")
+        value_col = header.index(value_col_name)
+        pos_col = header.index("position") if "position" in header else 2
+
         for line in f:
             parts = line.strip().split("\t")
-            if len(parts) <= value_col:
+            if len(parts) <= max(value_col, pos_col):
                 continue
             uid = parts[0]
-            pos = int(parts[2])
+            pos = int(parts[pos_col])
             val = float(parts[value_col])
             if positive_above:
                 label = 1 if val >= threshold else 0
@@ -386,7 +393,7 @@ def main():
     feat_cfg = FEATURE_REGISTRY[args.feature_source]
     feat_refer = feat_cfg["refer"]
     feat_val = feat_cfg["val"]
-    feat_value_col = feat_cfg["value_col"]
+    feat_value_col_name = feat_cfg["value_col_name"]
     feat_positive_above = feat_cfg["positive_above"]
     feat_threshold = (args.feature_threshold if args.feature_threshold is not None
                       else feat_cfg["default_threshold"])
@@ -437,7 +444,7 @@ def main():
 
     # ---- 7.1 读取 refer 集 ----
     print("\n--- 7.1 读取 refer 集 ---")
-    refer_data = load_feature_data(feat_refer, feat_value_col,
+    refer_data = load_feature_data(feat_refer, feat_value_col_name,
                                    feat_threshold, feat_positive_above)
     n_refer_pos = sum(labels.sum() for _, labels in refer_data.values())
     n_refer_neg = sum(len(labels) - labels.sum() for _, labels in refer_data.values())
@@ -546,7 +553,7 @@ def main():
 
     # ---- 7.5 Validation 集评估 (仅 top-N) ----
     print(f"\n--- 7.5 评估 validation 集 (top-{args.top_n} features) ---")
-    val_data = load_feature_data(feat_val, feat_value_col,
+    val_data = load_feature_data(feat_val, feat_value_col_name,
                                  feat_threshold, feat_positive_above)
     n_val_pos = sum(labels.sum() for _, labels in val_data.values())
     n_val_neg = sum(len(labels) - labels.sum() for _, labels in val_data.values())
