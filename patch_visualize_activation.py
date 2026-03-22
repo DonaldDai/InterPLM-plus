@@ -111,14 +111,16 @@ def load_feature_for_uid(
     feature_file: Path,
     uid: str,
     feature_col_name: str,
-) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+) -> Optional[Tuple[np.ndarray, np.ndarray, List[str]]]:
     """
-    返回 (positions, values) 或 None (找不到)
+    返回 (positions, values, residues) 或 None (找不到)
       positions: 0-based int array
       values:    float array
+      residues:  单字母氨基酸 list
     """
     positions = []
     values = []
+    residues = []
 
     with open(feature_file) as f:
         header = f.readline().strip().split("\t")
@@ -126,6 +128,7 @@ def load_feature_for_uid(
             return None
         val_col = header.index(feature_col_name)
         pos_col = header.index("position") if "position" in header else 2
+        res_col = header.index("residue") if "residue" in header else -1
 
         for line in f:
             parts = line.strip().split("\t")
@@ -135,10 +138,11 @@ def load_feature_for_uid(
                 continue
             positions.append(int(parts[pos_col]))
             values.append(float(parts[val_col]))
+            residues.append(parts[res_col] if res_col >= 0 and res_col < len(parts) else "?")
 
     if not positions:
         return None
-    return np.array(positions, dtype=np.int64), np.array(values, dtype=np.float64)
+    return np.array(positions, dtype=np.int64), np.array(values, dtype=np.float64), residues
 
 
 # ============================================================
@@ -151,6 +155,7 @@ def plot_activation(
     sae_threshold: float,
     positions: Optional[np.ndarray],
     feature_positive: Optional[np.ndarray],
+    residues: Optional[List[str]],
     feature_name: str,
     output_path: Path,
 ):
@@ -161,22 +166,19 @@ def plot_activation(
       activations:    shape (seq_len,) 单个 feature 的 activation 值
       feature_positive: shape (seq_len,) bool, True=该位置生物特征为positive
                         None=无特征数据, 全部用默认颜色
+      residues:       len=seq_len 单字母氨基酸, 标注超阈值位点; None=不标注
     """
     seq_len = len(activations)
     x = np.arange(1, seq_len + 1)  # 1-based
 
     fig, ax = plt.subplots(figsize=(max(14, seq_len / 50), 5))
 
-    # 默认颜色
     default_color = "#4C72B0"
     positive_color = "#E8790C"  # 加州橙
 
     if feature_positive is not None and len(feature_positive) == seq_len:
-        # 有特征数据: positive 区域用橙色, 其余蓝色
-        # 画线: 先画全部蓝色底线, 再覆盖橙色段
         ax.plot(x, activations, color=default_color, linewidth=0.6, alpha=0.5, zorder=1)
 
-        # positive 点
         pos_mask = feature_positive
         neg_mask = ~feature_positive
         ax.scatter(x[neg_mask], activations[neg_mask],
@@ -184,7 +186,6 @@ def plot_activation(
         ax.scatter(x[pos_mask], activations[pos_mask],
                    s=5, color=positive_color, alpha=0.8, zorder=3, label="positive")
 
-        # 橙色线段: 连接相邻positive点
         pos_indices = np.where(pos_mask)[0]
         for i in range(len(pos_indices) - 1):
             if pos_indices[i + 1] - pos_indices[i] == 1:
@@ -198,6 +199,19 @@ def plot_activation(
     # activation 阈值线
     ax.axhline(y=sae_threshold, color="red", linestyle="--", linewidth=0.8,
                label=f"SAE threshold={sae_threshold}", zorder=4)
+
+    # 标注超过阈值的氨基酸单字母
+    if residues is not None and len(residues) == seq_len:
+        for idx in range(seq_len):
+            if activations[idx] >= sae_threshold:
+                aa = residues[idx]
+                color = (positive_color
+                         if feature_positive is not None and feature_positive[idx]
+                         else default_color)
+                ax.annotate(aa, (x[idx], activations[idx]),
+                            textcoords="offset points", xytext=(0, 5),
+                            fontsize=5, ha="center", va="bottom",
+                            color=color, fontweight="bold", zorder=5)
 
     ax.set_xlabel("Residue Position (1-based)", fontsize=11)
     ax.set_ylabel(f"SAE Feature {feature_idx} Activation", fontsize=11)
@@ -214,19 +228,19 @@ def plot_activation(
 # ============================================================
 DEFAULT_UNIPROT_IDS = ["O60603"]
 # kd
-# DEFAULT_FEATURE_IDX = 9740
-# DEFAULT_FEATURE_NAME = "kd_hydrophobic"
-# DEFAULT_FEATURE_FILE = "cusdata/04_kd/kd_per_residue.tsv"
-# DEFAULT_FEATURE_COL = "kd_value"
-# DEFAULT_FEATURE_THRESHOLD = 1.8
-# DEFAULT_POSITIVE_ABOVE = True
-# rsa
 DEFAULT_FEATURE_IDX = 9740
-DEFAULT_FEATURE_NAME = "rsa_hydrophobic"
-DEFAULT_FEATURE_FILE = "cusdata/05_1_alphafold_rsa/rsa_per_residue.tsv"
-DEFAULT_FEATURE_COL = "rsa"
-DEFAULT_FEATURE_THRESHOLD = 0.25
-DEFAULT_POSITIVE_ABOVE = False
+DEFAULT_FEATURE_NAME = "kd_hydrophobic"
+DEFAULT_FEATURE_FILE = "cusdata/04_kd/kd_per_residue.tsv"
+DEFAULT_FEATURE_COL = "kd_value"
+DEFAULT_FEATURE_THRESHOLD = 1.8
+DEFAULT_POSITIVE_ABOVE = True
+# rsa
+# DEFAULT_FEATURE_IDX = 9740
+# DEFAULT_FEATURE_NAME = "rsa_hydrophobic"
+# DEFAULT_FEATURE_FILE = "cusdata/05_1_alphafold_rsa/rsa_per_residue.tsv"
+# DEFAULT_FEATURE_COL = "rsa"
+# DEFAULT_FEATURE_THRESHOLD = 0.25
+# DEFAULT_POSITIVE_ABOVE = False
 
 
 # ============================================================
@@ -362,21 +376,24 @@ def main():
 
         # 3. 读取生物特征
         feature_positive = None
+        residues_arr = None
         feat_result = load_feature_for_uid(feature_file, uid, args.feature_col)
 
         if feat_result is None:
             logger.log("feature", "not_found",
                        f"uid={uid}, file={feature_file}, col={args.feature_col}")
         else:
-            positions, values = feat_result
-            # 构建 seq_len 长度的 bool 数组
+            positions, values, feat_residues = feat_result
+            # 构建 seq_len 长度的 bool 数组和残基数组
             feature_positive = np.zeros(seq_len, dtype=bool)
-            for pos, val in zip(positions, values):
+            residues_arr = ["?"] * seq_len
+            for pos, val, aa in zip(positions, values, feat_residues):
                 if 0 <= pos < seq_len:
                     if args.positive_above:
                         feature_positive[pos] = (val >= args.feature_threshold)
                     else:
                         feature_positive[pos] = (val < args.feature_threshold)
+                    residues_arr[pos] = aa
 
             n_pos = feature_positive.sum()
             logger.log("feature", "ok",
@@ -394,7 +411,8 @@ def main():
                 uid, activations, args.feature_idx,
                 args.sae_threshold,
                 None if feat_result is None else positions,
-                feature_positive, args.feature_name, out_path)
+                feature_positive, residues_arr,
+                args.feature_name, out_path)
             logger.log("plot", "saved", f"uid={uid}, file={out_path}")
             print(f"  保存: {out_path}")
             n_ok += 1
