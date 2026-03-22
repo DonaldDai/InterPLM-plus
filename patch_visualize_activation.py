@@ -13,6 +13,10 @@ patch_visualize_activation.py — 绘制特定 SAE feature 的逐氨基酸激活
   cusdata/eval_img/{feature_name}/AF-{uid}_f{feature_idx}_t{threshold}.png
 
 用法:
+  # 直接跑 (使用代码中的默认值, 改 DEFAULT_* 常量即可调试)
+  python patch_visualize_activation.py
+
+  # 命令行覆盖
   python patch_visualize_activation.py \\
     --uniprot-ids Q15399 O60603 \\
     --feature-idx 3842 \\
@@ -206,29 +210,48 @@ def plot_activation(
 
 
 # ============================================================
+# 调试用默认值 (直接改这里, 省去命令行传参)
+# ============================================================
+DEFAULT_UNIPROT_IDS = ["O60603"]
+# kd
+# DEFAULT_FEATURE_IDX = 9740
+# DEFAULT_FEATURE_NAME = "kd_hydrophobic"
+# DEFAULT_FEATURE_FILE = "cusdata/04_kd/kd_per_residue.tsv"
+# DEFAULT_FEATURE_COL = "kd_value"
+# DEFAULT_FEATURE_THRESHOLD = 1.8
+# DEFAULT_POSITIVE_ABOVE = True
+# rsa
+DEFAULT_FEATURE_IDX = 9740
+DEFAULT_FEATURE_NAME = "rsa_hydrophobic"
+DEFAULT_FEATURE_FILE = "cusdata/05_1_alphafold_rsa/rsa_per_residue.tsv"
+DEFAULT_FEATURE_COL = "rsa"
+DEFAULT_FEATURE_THRESHOLD = 0.25
+DEFAULT_POSITIVE_ABOVE = False
+
+
+# ============================================================
 # 主流程
 # ============================================================
 def main():
     parser = argparse.ArgumentParser(
         description="绘制 SAE feature activation 逐残基可视化")
 
-    # 必需
-    parser.add_argument("--uniprot-ids", nargs="+", required=True,
-                        help="要绘制的 UniProt ID 列表")
-    parser.add_argument("--feature-idx", type=int, required=True,
-                        help="要可视化的 SAE feature 序号")
+    parser.add_argument("--uniprot-ids", nargs="+", default=DEFAULT_UNIPROT_IDS,
+                        help=f"UniProt ID 列表 (默认: {DEFAULT_UNIPROT_IDS})")
+    parser.add_argument("--feature-idx", type=int, default=DEFAULT_FEATURE_IDX,
+                        help=f"SAE feature 序号 (默认: {DEFAULT_FEATURE_IDX})")
 
-    # 生物特征
-    parser.add_argument("--feature-name", type=str, required=True,
-                        help="特征名 (用于输出目录和标题)")
-    parser.add_argument("--feature-file", type=str, required=True,
-                        help="逐氨基酸特征 TSV 文件路径")
-    parser.add_argument("--feature-col", type=str, required=True,
-                        help="特征值列名 (如 kd_value, rsa)")
-    parser.add_argument("--feature-threshold", type=float, required=True,
-                        help="特征二值化阈值")
-    parser.add_argument("--positive-above", action="store_true", default=True,
-                        help="value >= threshold → positive (默认)")
+    parser.add_argument("--feature-name", type=str, default=DEFAULT_FEATURE_NAME,
+                        help=f"特征名/输出目录 (默认: {DEFAULT_FEATURE_NAME})")
+    parser.add_argument("--feature-file", type=str, default=DEFAULT_FEATURE_FILE,
+                        help=f"逐氨基酸特征 TSV (默认: {DEFAULT_FEATURE_FILE})")
+    parser.add_argument("--feature-col", type=str, default=DEFAULT_FEATURE_COL,
+                        help=f"特征值列名 (默认: {DEFAULT_FEATURE_COL})")
+    parser.add_argument("--feature-threshold", type=float, default=DEFAULT_FEATURE_THRESHOLD,
+                        help=f"特征二值化阈值 (默认: {DEFAULT_FEATURE_THRESHOLD})")
+    parser.add_argument("--positive-above", action="store_true",
+                        default=DEFAULT_POSITIVE_ABOVE,
+                        help="value >= threshold → positive (默认)" if DEFAULT_POSITIVE_ABOVE else argparse.SUPPRESS)
     parser.add_argument("--no-positive-above", dest="positive_above",
                         action="store_false",
                         help="value < threshold → positive")
