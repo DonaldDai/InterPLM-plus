@@ -245,10 +245,22 @@ def compute_f1(tp: np.ndarray, fp: np.ndarray, fn: np.ndarray
     """
     返回 (f1, precision, recall) 各为 float64 数组
     """
-    precision = np.where(tp + fp > 0, tp / (tp + fp), 0.0)
-    recall = np.where(tp + fn > 0, tp / (tp + fn), 0.0)
-    f1 = np.where(precision + recall > 0,
-                  2 * precision * recall / (precision + recall), 0.0)
+    tp = tp.astype(np.float64)
+    fp = fp.astype(np.float64)
+    fn = fn.astype(np.float64)
+
+    precision = np.zeros_like(tp)
+    recall = np.zeros_like(tp)
+    f1 = np.zeros_like(tp)
+
+    p_denom = tp + fp
+    r_denom = tp + fn
+    np.divide(tp, p_denom, out=precision, where=p_denom > 0)
+    np.divide(tp, r_denom, out=recall, where=r_denom > 0)
+
+    f1_denom = precision + recall
+    np.divide(2 * precision * recall, f1_denom, out=f1, where=f1_denom > 0)
+
     return f1, precision, recall
 
 
@@ -402,9 +414,10 @@ def main():
 
     # 统计 refer F1 分布
     f1_nonzero = f1_r[f1_r > 0]
+    mean_nz = f1_nonzero.mean() if len(f1_nonzero) > 0 else 0.0
     logger.log("7.3_refer", "f1_stats",
                f"max={f1_r.max():.4f}, "
-               f"mean_nonzero={f1_nonzero.mean():.4f if len(f1_nonzero) > 0 else 0:.4f}, "
+               f"mean_nonzero={mean_nz:.4f}, "
                f"n_nonzero={len(f1_nonzero)}/{n_features}")
 
     # ---- 7.4 选出 top-N ----
