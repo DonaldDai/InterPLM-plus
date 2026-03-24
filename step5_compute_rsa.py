@@ -123,14 +123,13 @@ if HAS_BIOPYTHON:
     class ProteinSelect(Select):
         """
         PDBIO导出过滤器:
-        - 只保留标准氨基酸 (20种 + MSE/SEC)
-        - 跳过水、离子、配体、核酸 (A/U/G/C/DA/DT/DG/DC)
+        - 残基级: 只保留标准氨基酸 (20种 + MSE/SEC)
+        - 原子级: 跳过氢原子 (FreeSASA不需要H, 且H占总原子数~50%)
 
-        解决两个问题:
-        1. 原子数 > 99,999 导致PDB序号溢出
-           (去掉水和核酸后通常能砍掉50%以上原子)
-        2. FreeSASA不需要处理非蛋白原子
-           (减少计算量, 也避免unknown_resnames警告)
+        解决三个问题:
+        1. 去掉水/核酸/配体 → 大幅减少原子数
+        2. 去掉氢原子 → 再减半 (PDB中含H的结构很常见)
+        3. FreeSASA的SASA计算本身就只用重原子
         """
         def accept_residue(self, residue):
             resname = residue.resname.strip().upper()
@@ -148,10 +147,17 @@ if HAS_BIOPYTHON:
                 return False
             return True
 
+        def accept_atom(self, atom):
+            # 跳过氢原子 (element='H' 或 'D'=deuterium)
+            elem = atom.element.strip().upper()
+            if elem in ("H", "D"):
+                return False
+            return True
+
 
 
 # 多进程配置
-NUM_WORKERS = 8   # 根据CPU核数调整, 建议 = 物理核心数
+NUM_WORKERS = 4   # 根据CPU核数调整, 建议 = 物理核心数
 
 
 # ============================================================
@@ -421,12 +427,14 @@ def compute_sasa(cif_path: Path) -> Tuple[Optional[freesasa.Structure],
                     chain_id_map[chain.id] = chain.id
 
             # 兜底: 过滤后原子数仍可能超过99,999 (巨型蛋白复合物)
-            # 统计过滤后的原子数, 超限则逐链移除直到安全
+            # 统计的原子数必须和 PDBIO.save(select=ProteinSelect()) 实际写出的一致
             PDB_ATOM_LIMIT = 99999
+            _sel = ProteinSelect()
+
             atom_count = sum(
                 1 for chain in model for res in chain
-                if ProteinSelect().accept_residue(res)
-                for atom in res if atom.element.strip() != "H"
+                if _sel.accept_residue(res)
+                for atom in res if _sel.accept_atom(atom)
             )
 
             if atom_count > PDB_ATOM_LIMIT:
@@ -434,8 +442,8 @@ def compute_sasa(cif_path: Path) -> Tuple[Optional[freesasa.Structure],
                 chain_atoms = []
                 for chain in model:
                     n = sum(1 for res in chain
-                            if ProteinSelect().accept_residue(res)
-                            for atom in res if atom.element.strip() != "H")
+                            if _sel.accept_residue(res)
+                            for atom in res if _sel.accept_atom(atom))
                     chain_atoms.append((chain.id, n))
                 chain_atoms.sort(key=lambda x: x[1])
 

@@ -1,33 +1,34 @@
 """
-Step 6: Refer集 / 验证集划分
-=============================
+Step 6: Refer集 / 验证集划分 (多特征, 各自独立)
+=================================================
 
-基于 step4 的KD标注可用性和 CD-HIT 聚类结果，
-将数据划分为 refer 集和验证集。
-
-流程:
-  1. 从原始FASTA中过滤掉不在step4结果中的 uniprot_id
+对每个注册的特征, 独立执行完整流程:
+  1. 从原始FASTA中过滤掉不在该特征结果中的 uniprot_id
   2. 用 CD-HIT (90% identity, word size 5) 聚类过滤后的FASTA
   3. 取每个cluster的代表蛋白, 按 85:15 比例拆分 refer/validation
-  4. 根据拆分结果, 从step4的KD标注中筛选出两个子集分别保存
+  4. 根据拆分结果, 从该特征标注中筛选出两个子集分别保存
+
+不同特征的可用蛋白集合不同, 所以每个特征拥有完全独立的输出目录。
 
 输入:
   cusdata/01_raw/uniprot_pdb_sequences.fasta
-  cusdata/04_kd/kd_per_residue.tsv
+  cusdata/04_kd/kd_per_residue.tsv              (特征: kd)
+  cusdata/05_1_alphafold_rsa/rsa_per_residue.tsv (特征: rsa)
 
-输出:
-  cusdata/06_splits/
-  ├── filtered.fasta                ← 过滤后的FASTA (仅含step4中有KD标注的蛋白)
-  ├── cdhit_id90                    ← CD-HIT代表序列
-  ├── cdhit_id90.clstr              ← CD-HIT聚类结果
-  ├── refer_ids.txt                 ← refer集 uniprot_id 列表
-  ├── val_ids.txt                   ← 验证集 uniprot_id 列表
-  ├── kd_refer.tsv                  ← refer集 KD标注
-  ├── kd_val.tsv                    ← 验证集 KD标注
-  └── split_log.tsv                 ← 全流程日志
+输出 (每个特征独立):
+  cusdata/06_splits/{feature_name}/
+  ├── filtered.fasta
+  ├── cdhit_id90 + .clstr
+  ├── refer_ids.txt
+  ├── val_ids.txt
+  ├── refer.tsv
+  ├── val.tsv
+  └── split_log.tsv
 
 用法:
-  python step6_split_datasets.py
+  python step6_split_datasets.py                  # 全部特征
+  python step6_split_datasets.py --features kd    # 只处理KD
+  python step6_split_datasets.py --features kd rsa
   python step6_split_datasets.py --val-ratio 0.15 --seed 42
   python step6_split_datasets.py --whitelist-file my_ids.txt
 """
@@ -54,8 +55,14 @@ except ImportError:
 # 配置
 # ============================================================
 RAW_FASTA = Path("cusdata/01_raw/uniprot_pdb_sequences.fasta")
-KD_FILE = Path("cusdata/04_kd/kd_per_residue.tsv")
-OUTPUT_DIR = Path("cusdata/06_splits")
+OUTPUT_BASE = Path("cusdata/06_splits")
+
+# ---- 特征注册表 ----
+# name → source TSV (第一列必须是 uniprot_id)
+FEATURES: Dict[str, Path] = {
+    # "kd":  Path("cusdata/04_kd/kd_per_residue.tsv"),
+    "rsa": Path("cusdata/05_1_alphafold_rsa/rsa_per_residue.tsv"),
+}
 
 # CD-HIT 参数
 CDHIT_IDENTITY = 0.90
@@ -113,30 +120,30 @@ class StepLogger:
 
 
 # ============================================================
-# Step 6.1: 过滤FASTA — 只保留step4中有KD标注的蛋白
+# Step 6.1: 过滤FASTA — 只保留特征文件中有标注的蛋白
 # ============================================================
-def filter_fasta_by_kd(
+def filter_fasta_by_feature(
     raw_fasta: Path,
-    kd_file: Path,
+    feature_file: Path,
     output_fasta: Path,
     logger: StepLogger,
 ) -> Set[str]:
     """
     返回过滤后保留的 uniprot_id 集合
     """
-    logger.log("6.1_filter", "start", f"raw_fasta={raw_fasta}, kd_file={kd_file}")
+    logger.log("6.1_filter", "start", f"raw_fasta={raw_fasta}, feature_file={feature_file}")
 
-    # 从KD文件提取有标注的 uniprot_id
-    kd_uids: Set[str] = set()
-    with open(kd_file) as f:
+    # 从特征文件提取有标注的 uniprot_id
+    feature_uids: Set[str] = set()
+    with open(feature_file) as f:
         f.readline()  # skip header
         for line in f:
             uid = line.split("\t", 1)[0]
             if uid:
-                kd_uids.add(uid)
-    logger.log("6.1_filter", "kd_ids_loaded", f"n={len(kd_uids)}")
+                feature_uids.add(uid)
+    logger.log("6.1_filter", "feature_ids_loaded", f"n={len(feature_uids)}")
 
-    # 遍历FASTA, 只保留在kd_uids中的序列
+    # 遍历FASTA, 只保留在feature_uids中的序列
     kept_uids: Set[str] = set()
     dropped_uids: List[str] = []
     n_total = 0
@@ -147,7 +154,7 @@ def filter_fasta_by_kd(
             uid = parts[1] if len(parts) >= 2 else record.id
             n_total += 1
 
-            if uid in kd_uids:
+            if uid in feature_uids:
                 SeqIO.write(record, fout, "fasta")
                 kept_uids.add(uid)
             else:
@@ -281,7 +288,7 @@ def split_by_clusters(
 
     for uid in sorted(whitelist_missing):
         logger.log("6.3_split", "whitelist_missing",
-                   f"uniprot_id={uid} not found in any cluster (可能被step4过滤)")
+                   f"uniprot_id={uid} not found in any cluster (可能被过滤)")
 
     logger.log("6.3_split", "whitelist_summary",
                f"found={len(whitelist_found)}, missing={len(whitelist_missing)}, "
@@ -341,22 +348,22 @@ def split_by_clusters(
 
 
 # ============================================================
-# Step 6.4: 根据拆分结果筛选KD标注
+# Step 6.4: 根据拆分结果筛选特征标注
 # ============================================================
-def split_kd_file(
-    kd_file: Path,
+def split_feature_file(
+    feature_file: Path,
     refer_uids: Set[str],
     val_uids: Set[str],
     output_dir: Path,
     logger: StepLogger,
 ):
     """
-    读取step4的KD标注, 按refer/val集合分别写入两个文件
+    读取特征标注TSV, 按refer/val集合分别写入两个文件
     """
-    logger.log("6.4_split_kd", "start", f"kd_file={kd_file}")
+    logger.log("6.4_split", "start", f"feature_file={feature_file}")
 
-    refer_out = output_dir / "kd_refer.tsv"
-    val_out = output_dir / "kd_val.tsv"
+    refer_out = output_dir / "refer.tsv"
+    val_out = output_dir / "val.tsv"
 
     n_refer = 0
     n_val = 0
@@ -364,7 +371,7 @@ def split_kd_file(
     refer_proteins: Set[str] = set()
     val_proteins: Set[str] = set()
 
-    with open(kd_file) as fin, \
+    with open(feature_file) as fin, \
          open(refer_out, "w") as f_refer, \
          open(val_out, "w") as f_val:
 
@@ -386,16 +393,16 @@ def split_kd_file(
             else:
                 n_skipped += 1
 
-    logger.log("6.4_split_kd", "refer",
+    logger.log("6.4_split", "refer",
                f"proteins={len(refer_proteins)}, residues={n_refer}, file={refer_out}")
-    logger.log("6.4_split_kd", "val",
+    logger.log("6.4_split", "val",
                f"proteins={len(val_proteins)}, residues={n_val}, file={val_out}")
 
     if n_skipped > 0:
-        logger.log("6.4_split_kd", "skipped",
+        logger.log("6.4_split", "skipped",
                    f"residues={n_skipped} (不在refer也不在val, 不应发生)")
 
-    logger.log("6.4_split_kd", "done",
+    logger.log("6.4_split", "done",
                f"refer={len(refer_proteins)}_proteins/{n_refer}_residues, "
                f"val={len(val_proteins)}_proteins/{n_val}_residues")
 
@@ -404,7 +411,12 @@ def split_kd_file(
 # 主流程
 # ============================================================
 def main():
+    available_features = list(FEATURES.keys())
+
     parser = argparse.ArgumentParser(description="Step 6: Refer/Validation split")
+    parser.add_argument("--features", nargs="+", default=available_features,
+                        choices=available_features,
+                        help=f"要处理的特征 (默认: {available_features})")
     parser.add_argument("--val-ratio", type=float, default=VAL_RATIO,
                         help=f"验证集比例 (默认: {VAL_RATIO})")
     parser.add_argument("--seed", type=int, default=RANDOM_SEED,
@@ -431,87 +443,114 @@ def main():
         whitelist = set(HUMAN_TLR_IDS)
         print(f"  白名单: 内置人类TLR1-10 ({len(whitelist)} IDs)")
 
+    # 检查FASTA
+    if not RAW_FASTA.exists():
+        print(f"ERROR: 原始FASTA不存在: {RAW_FASTA}")
+        return
+
+    # 筛选可用特征
+    enabled: Dict[str, Path] = {}
+    for name in args.features:
+        fp = FEATURES[name]
+        if fp.exists():
+            enabled[name] = fp
+        else:
+            print(f"WARNING: [{name}] 源文件不存在, 跳过: {fp}")
+
+    if not enabled:
+        print("ERROR: 没有可用特征")
+        return
+
     print("=" * 60)
     print("Step 6: Refer集 / 验证集划分")
-    print(f"  val_ratio={args.val_ratio}, seed={args.seed}")
-    print(f"  whitelist={len(whitelist)} IDs → 强制验证集")
+    print(f"  特征:      {list(enabled.keys())}")
+    print(f"  val_ratio: {args.val_ratio}, seed: {args.seed}")
+    print(f"  whitelist: {len(whitelist)} IDs → 强制验证集")
     print("=" * 60)
 
-    # 检查输入
-    for fp, name in [(RAW_FASTA, "原始FASTA"), (KD_FILE, "KD标注")]:
-        if not fp.exists():
-            print(f"ERROR: {name}不存在: {fp}")
-            return
+    # ---- 逐特征独立处理 ----
+    for feat_name, feat_file in enabled.items():
+        feat_dir = OUTPUT_BASE / feat_name
+        feat_dir.mkdir(parents=True, exist_ok=True)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    logger = StepLogger(OUTPUT_DIR / "split_log.tsv")
+        print(f"\n{'='*60}")
+        print(f"特征: {feat_name}")
+        print(f"  源文件: {feat_file}")
+        print(f"  输出:   {feat_dir}/")
+        print(f"{'='*60}")
 
-    logger.log("main", "start",
-               f"raw_fasta={RAW_FASTA}, kd_file={KD_FILE}, "
-               f"val_ratio={args.val_ratio}, seed={args.seed}, "
-               f"whitelist_size={len(whitelist)}")
-    t0 = time.time()
+        logger = StepLogger(feat_dir / "split_log.tsv")
+        logger.log("main", "start",
+                   f"feature={feat_name}, source={feat_file}, "
+                   f"val_ratio={args.val_ratio}, seed={args.seed}, "
+                   f"whitelist_size={len(whitelist)}")
+        t0 = time.time()
 
-    # ---- 6.1 过滤FASTA ----
-    print("\n--- 6.1 过滤FASTA ---")
-    filtered_fasta = OUTPUT_DIR / "filtered.fasta"
-    kept_uids = filter_fasta_by_kd(RAW_FASTA, KD_FILE, filtered_fasta, logger)
+        # ---- 6.1 过滤FASTA ----
+        print("\n--- 6.1 过滤FASTA ---")
+        filtered_fasta = feat_dir / "filtered.fasta"
+        kept_uids = filter_fasta_by_feature(RAW_FASTA, feat_file, filtered_fasta, logger)
 
-    # ---- 6.2 CD-HIT聚类 ----
-    print("\n--- 6.2 CD-HIT聚类 ---")
-    cdhit_prefix = OUTPUT_DIR / "cdhit_id90"
-    clusters, representatives = run_cdhit(filtered_fasta, cdhit_prefix, logger)
+        if not kept_uids:
+            logger.log("main", "abort", "0 proteins after filtering")
+            continue
 
-    # ---- 6.3 拆分 ----
-    print("\n--- 6.3 拆分refer/val ---")
-    refer_uids, val_uids = split_by_clusters(
-        clusters, representatives, args.val_ratio, args.seed, whitelist, logger)
+        # ---- 6.2 CD-HIT聚类 ----
+        print("\n--- 6.2 CD-HIT聚类 ---")
+        cdhit_prefix = feat_dir / "cdhit_id90"
+        clusters, representatives = run_cdhit(filtered_fasta, cdhit_prefix, logger)
 
-    # 保存ID列表
-    refer_ids_file = OUTPUT_DIR / "refer_ids.txt"
-    val_ids_file = OUTPUT_DIR / "val_ids.txt"
-    with open(refer_ids_file, "w") as f:
-        for uid in sorted(refer_uids):
-            f.write(f"{uid}\n")
-    with open(val_ids_file, "w") as f:
-        for uid in sorted(val_uids):
-            f.write(f"{uid}\n")
-    logger.log("6.3_split", "saved",
-               f"refer_ids={refer_ids_file}, val_ids={val_ids_file}")
+        # ---- 6.3 拆分 ----
+        print("\n--- 6.3 拆分refer/val ---")
+        refer_uids, val_uids = split_by_clusters(
+            clusters, representatives, args.val_ratio, args.seed, whitelist, logger)
 
-    # ---- 6.4 筛选KD标注 ----
-    print("\n--- 6.4 筛选KD标注 ---")
-    split_kd_file(KD_FILE, refer_uids, val_uids, OUTPUT_DIR, logger)
+        # 保存ID列表
+        refer_ids_file = feat_dir / "refer_ids.txt"
+        val_ids_file = feat_dir / "val_ids.txt"
+        with open(refer_ids_file, "w") as f:
+            for uid in sorted(refer_uids):
+                f.write(f"{uid}\n")
+        with open(val_ids_file, "w") as f:
+            for uid in sorted(val_uids):
+                f.write(f"{uid}\n")
+        logger.log("6.3_split", "saved",
+                   f"refer_ids={refer_ids_file}, val_ids={val_ids_file}")
 
-    # ---- 摘要 ----
-    elapsed = time.time() - t0
-    logger.log("main", "done", f"elapsed={elapsed:.1f}s")
+        # ---- 6.4 筛选特征标注 ----
+        print("\n--- 6.4 筛选特征标注 ---")
+        split_feature_file(feat_file, refer_uids, val_uids, feat_dir, logger)
 
-    # 统计白名单蛋白最终在哪
-    wl_in_val = whitelist & val_uids
-    wl_in_refer = whitelist & refer_uids
-    wl_missing = whitelist - val_uids - refer_uids
+        # ---- 摘要 ----
+        elapsed = time.time() - t0
+        logger.log("main", "done", f"elapsed={elapsed:.1f}s")
 
-    print()
-    print("=" * 60)
-    print("完成")
-    print("=" * 60)
-    print(f"  过滤后蛋白:  {len(kept_uids)}")
-    print(f"  Clusters:    {len(clusters)}")
-    print(f"  Refer集:     {len(refer_uids)} proteins")
-    print(f"  验证集:      {len(val_uids)} proteins")
-    print(f"  白名单:      {len(wl_in_val)} in val, "
-          f"{len(wl_in_refer)} in refer (应为0), "
-          f"{len(wl_missing)} missing")
-    print(f"  耗时:        {elapsed:.1f}s")
-    print()
-    print("输出文件:")
-    for f in [filtered_fasta, cdhit_prefix, refer_ids_file, val_ids_file,
-              OUTPUT_DIR / "kd_refer.tsv", OUTPUT_DIR / "kd_val.tsv",
-              OUTPUT_DIR / "split_log.tsv"]:
-        if f.exists():
-            sz = f.stat().st_size / (1024 * 1024)
-            print(f"  {f} ({sz:.1f} MB)")
+        wl_in_val = whitelist & val_uids
+        wl_in_refer = whitelist & refer_uids
+        wl_missing = whitelist - val_uids - refer_uids
+
+        print()
+        print(f"  [{feat_name}] 完成:")
+        print(f"    过滤后蛋白: {len(kept_uids)}")
+        print(f"    Clusters:   {len(clusters)}")
+        print(f"    Refer集:    {len(refer_uids)} proteins")
+        print(f"    验证集:     {len(val_uids)} proteins")
+        print(f"    白名单:     {len(wl_in_val)} in val, "
+              f"{len(wl_in_refer)} in refer (应为0), "
+              f"{len(wl_missing)} missing")
+        print(f"    耗时:       {elapsed:.1f}s")
+
+        print(f"\n    输出文件:")
+        for fp in [filtered_fasta, cdhit_prefix, refer_ids_file, val_ids_file,
+                   feat_dir / "refer.tsv", feat_dir / "val.tsv",
+                   feat_dir / "split_log.tsv"]:
+            if fp.exists():
+                sz = fp.stat().st_size / (1024 * 1024)
+                print(f"      {fp} ({sz:.1f} MB)")
+
+    print(f"\n{'='*60}")
+    print("全部完成")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":

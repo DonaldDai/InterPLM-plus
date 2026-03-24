@@ -99,8 +99,8 @@ DEFAULT_SAE_THRESHOLD = 0.5      # SAE activation >= 0.5 → active
 DEFAULT_PLM_MODEL = "esm2-8m"
 DEFAULT_PLM_LAYER = 4
 DEFAULT_BATCH_SIZE = 64
-DEFAULT_FEATURE_NAME = "rsa_hydrophobic"
-DEFAULT_FEATURE_SOURCE = "rsa"    # FEATURE_REGISTRY 中的 key
+DEFAULT_FEATURE_NAME = "kd_hydrophobic"
+DEFAULT_FEATURE_SOURCE = "kd"    # FEATURE_REGISTRY 中的 key
 
 
 # ============================================================

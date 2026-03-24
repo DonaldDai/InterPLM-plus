@@ -70,7 +70,7 @@ DEFAULT_MODEL = "esm2_t6_8M_UR50D"
 DEFAULT_LAYER = 4
 DEFAULT_BATCH_SIZE = 32
 
-ESM2_MAX_SEQ_LEN = 1024  # ESM-2 最大残基数
+ESM2_MAX_SEQ_LEN = 1022  # ESM-2 最大残基数
 
 
 # ============================================================
@@ -145,8 +145,22 @@ def main():
         return
 
     # 初始化 InterPLM ESMEmbedder
-    print(f"\n初始化 ESMEmbedder (model={args.model})...")
-    embedder = ESMEmbedder(model_name=args.model)
+    # ESMEmbedder 的接口可能接受 layer 在构造函数或在 extract_embeddings 中
+    print(f"\n初始化 ESMEmbedder (model={args.model}, layer={args.layer})...")
+    try:
+        embedder = ESMEmbedder(model_name=args.model, layer=args.layer)
+        _layer_in_init = True
+    except TypeError:
+        embedder = ESMEmbedder(model_name=args.model)
+        _layer_in_init = False
+        print(f"  (layer 将在 extract_embeddings 调用时传入)")
+
+    def _call_extract(seqs):
+        """封装 extract_embeddings 调用, 兼容不同签名"""
+        if _layer_in_init:
+            return embedder.extract_embeddings(seqs)
+        else:
+            return embedder.extract_embeddings(seqs, layer=args.layer)
 
     # 批量处理
     print(f"\n开始提取...\n")
@@ -154,6 +168,28 @@ def main():
     n_done = 0
     n_truncated = 0
     total_residues = 0
+
+    def _to_numpy(x):
+        """将 tensor 或 ndarray 统一转为 float32 numpy"""
+        if hasattr(x, 'cpu'):
+            return x.detach().cpu().float().numpy()
+        return np.asarray(x, dtype=np.float32)
+
+    def _split_by_lengths(raw, batch_seqs):
+        """
+        extract_embeddings 返回 (total_residues, dim) 的拼接矩阵,
+        按每条序列的长度切分为 list of (seq_len_i, dim)
+        """
+        arr = _to_numpy(raw)
+        results = []
+        offset = 0
+        for seq in batch_seqs:
+            slen = len(seq)
+            results.append(arr[offset:offset + slen, :].copy())
+            offset += slen
+        assert offset == arr.shape[0], \
+            f"长度不匹配: sum(seq_lens)={offset} != embedding.shape[0]={arr.shape[0]}"
+        return results
 
     with h5py.File(output_h5, "a") as h5f:
         for batch_start in range(0, len(todo_seqs), args.batch_size):
@@ -169,21 +205,22 @@ def main():
                 batch_seqs.append(seq)
 
             # 调用 InterPLM extract_embeddings
+            # 返回 (total_residues, dim) 拼接矩阵, 需按序列长度切分
             try:
-                embeddings = embedder.extract_embeddings(
-                    batch_seqs, layer=args.layer)
+                raw = _call_extract(batch_seqs)
+                embeddings = _split_by_lengths(raw, batch_seqs)
             except Exception as e:
                 print(f"  ERROR batch {batch_start}: {e}")
                 # 逐个重试
                 for uid, seq in zip(batch_uids, batch_seqs):
                     try:
-                        embs = embedder.extract_embeddings(
-                            [seq], layer=args.layer)
+                        raw_single = _call_extract([seq])
+                        emb = _split_by_lengths(raw_single, [seq])[0]
                         if uid not in h5f:
                             h5f.create_dataset(
-                                uid, data=embs[0],
+                                uid, data=emb,
                                 compression="gzip", compression_opts=4)
-                        total_residues += embs[0].shape[0]
+                        total_residues += emb.shape[0]
                         n_done += 1
                     except Exception as e2:
                         print(f"  SKIP {uid}: {e2}")
@@ -213,7 +250,7 @@ def main():
     if output_h5.exists():
         with h5py.File(output_h5, "r") as f:
             for key in f:
-                embed_dim = f[key].shape[1]
+                embed_dim = f[key].shape[1]  # (seq_len, dim)
                 break
 
     meta = {

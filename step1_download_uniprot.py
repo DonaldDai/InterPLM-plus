@@ -41,18 +41,18 @@ from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Set, Dict, List, Tuple
-import math
 
 
 # ============================================================
 # 配置区
 # ============================================================
-OUTPUT_DIR = Path("cusdata/01_raw")
+OUTPUT_DIR = Path("data/01_raw")
 FASTA_FILE = OUTPUT_DIR / "uniprot_pdb_sequences.fasta"
 MAPPING_FILE = OUTPUT_DIR / "uniprot_pdb_mapping.tsv"
 PDB_DIR = OUTPUT_DIR / "pdb_files"
 DOWNLOAD_LOG = OUTPUT_DIR / "download_log.json"
 RESOLUTION_FILE = OUTPUT_DIR / "pdb_resolution_filter.tsv"
+SIFTS_FILE = OUTPUT_DIR / "sifts_pdb_chain_uniprot.csv.gz"
 
 # UniProt REST API
 UNIPROT_API = "https://rest.uniprot.org/uniprotkb"
@@ -71,9 +71,7 @@ MIN_LENGTH = 50
 MAX_LENGTH = 1000
 
 # PDB下载参数
-# MAX_RESOLUTION = 2.5       # 只下载分辨率 ≤ 2.5Å 的结构 (NMR结构无分辨率，保留)
-# TODO： 尝试更严格的效果
-MAX_RESOLUTION = math.inf
+MAX_RESOLUTION = 3.5       # 只下载分辨率 ≤ 3.5Å 的结构 (NMR结构无分辨率，保留)
 PDB_DOWNLOAD_WORKERS = 8   # 并行下载线程数
 PDB_DOWNLOAD_RETRIES = 3   # 每个文件最大重试次数
 PDB_DOWNLOAD_TIMEOUT = 30  # 单个文件下载超时 (秒)
@@ -525,6 +523,62 @@ def validate_pdb_files(pdb_ids: Set[str], log: DownloadLog):
 # ============================================================
 # 汇总报告
 # ============================================================
+# ============================================================
+# Part D: 下载SIFTS残基级映射
+# ============================================================
+def download_sifts():
+    """
+    下载SIFTS的PDB链-UniProt残基区段映射文件
+    
+    来源: EBI SIFTS FTP
+    文件: pdb_chain_uniprot.csv.gz
+    
+    包含列:
+      PDB, CHAIN, SP_PRIMARY (UniProt accession),
+      RES_BEG, RES_END (PDB残基编号范围),
+      PDB_BEG, PDB_END (PDB残基编号, 可能有insertion code),
+      SP_BEG, SP_END   (UniProt序列位置范围)
+    
+    用途: 在step5中将PDB残基编号转换为UniProt序列位置
+    """
+    if SIFTS_FILE.exists():
+        size_mb = SIFTS_FILE.stat().st_size / (1024 * 1024)
+        print(f"[跳过] SIFTS文件已存在: {SIFTS_FILE} ({size_mb:.1f} MB)")
+        return
+    
+    url = "https://ftp.ebi.ac.uk/pub/databases/msd/sifts/flatfiles/csv/pdb_chain_uniprot.csv.gz"
+    print(f"下载SIFTS映射: {url}")
+    
+    try:
+        resp = requests.get(url, stream=True, timeout=120)
+        resp.raise_for_status()
+        
+        with open(SIFTS_FILE, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                f.write(chunk)
+        
+        size_mb = SIFTS_FILE.stat().st_size / (1024 * 1024)
+        print(f"  下载完成: {size_mb:.1f} MB")
+        
+        # 快速验证: 读前几行确认格式
+        import csv
+        with gzip.open(SIFTS_FILE, "rt") as f:
+            # 跳过注释行
+            for line in f:
+                if not line.startswith("#"):
+                    header = line.strip()
+                    break
+            print(f"  列名: {header}")
+            n = sum(1 for _ in f)
+            print(f"  数据行数: {n}")
+    
+    except Exception as e:
+        print(f"  WARNING: SIFTS下载失败: {e}")
+        print(f"  手动下载: wget {url} -O {SIFTS_FILE}")
+        if SIFTS_FILE.exists():
+            SIFTS_FILE.unlink()
+
+
 def print_summary(log: DownloadLog):
     """打印最终汇总"""
     print()
@@ -634,6 +688,15 @@ def main():
     
     # C-4: 验证
     validate_pdb_files(pdb_ids, log)
+    
+    # ----------------------------------------------------------
+    # D. 下载SIFTS残基级映射 (PDB残基 → UniProt序列位置)
+    # ----------------------------------------------------------
+    print()
+    print("━" * 60)
+    print("Part D: SIFTS PDB-UniProt 残基映射")
+    print("━" * 60)
+    download_sifts()
     
     # ----------------------------------------------------------
     # 汇总报告
