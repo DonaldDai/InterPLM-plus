@@ -20,7 +20,7 @@ def create_dashboard(
     sae_path: Path,
     embeddings_dir: Path,
     layer: int,
-    metadata_path: Path = Path("data/uniprotkb/swissprot_dense_annot_1k_subset.tsv.gz"),
+    metadata_path: Path = Path("data/annotations/uniprotkb/proteins.tsv.gz"),
     dashboard_name: str = "walkthrough",
     model_name: str = "esm",
     model_type: str = "esm2_t6_8M_UR50D",

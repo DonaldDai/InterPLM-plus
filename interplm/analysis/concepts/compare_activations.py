@@ -437,7 +437,7 @@ def analyze_all_shards_in_set(
     with open(eval_set_dir / "metadata.json", "r") as f:
         shards_to_eval = json.load(f)["shard_source"]
         print(f"Analyzing set {eval_set_dir.stem} with {shards_to_eval} shards")
-
+    
     # Process each shard sequentially
     for shard in shards_to_eval:
         analyze_concepts(
