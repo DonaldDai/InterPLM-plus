@@ -289,11 +289,13 @@ def process_one_protein(args_tuple: Tuple) -> Tuple[str, List[dict], List[str]]:
         _log("ERR", f"{ts}\t{uid}\tcif_field_error\t{type(e).__name__}: {e}\n")
         return uid, [], logs
 
-    # 构建 (chain, auth_seq_id) → uniprot_pos 映射
+    # 构建 auth_seq_id → uniprot_pos 映射
+    # 已按 chain_id 过滤, 不需要 chain 作为 key
     # FreeSASA 通过 BioPython PDBIO 导出的 PDB 使用 auth 编号,
     # 所以 key 必须用 auth_seq_id 才能和 FreeSASA 的 residueNumber 对齐
-    residue_uniprot_map: Dict[Tuple[str, str], int] = {}  # (chain, auth_seq_id) → uniprot_pos
-    seen_residues: Set[Tuple[str, str]] = set()
+    residue_uniprot_map: Dict[str, int] = {}  # auth_seq_id → uniprot_pos
+    seen_seq_ids: Set[str] = set()
+    _abort = False
 
     for i in range(len(auth_asym_ids)):
         if group_pdb[i] != "ATOM":
@@ -302,16 +304,31 @@ def process_one_protein(args_tuple: Tuple) -> Tuple[str, List[dict], List[str]]:
         if chain != chain_id:
             continue
 
-        seq_id = auth_seq_ids[i]  # auth_seq_id — 和 FreeSASA 输出一致
-        key = (chain, seq_id)
-        if key in seen_residues:
-            continue
-        seen_residues.add(key)
+        seq_id = auth_seq_ids[i]
 
-        # 检查 SIFTS 标注是否指向 UniProt
+        # 解析当前行的 uniprot_pos
         db_name = sifts_db_names[i] if i < len(sifts_db_names) else ""
         db_num = sifts_db_nums[i] if i < len(sifts_db_nums) else "?"
 
+        if seq_id in seen_seq_ids:
+            # 同一 auth_seq_id 出现多次 (同残基多原子): 检查映射是否一致
+            if db_num not in ("?", ".", "") and seq_id in residue_uniprot_map:
+                try:
+                    new_pos = int(db_num) - 1
+                    if new_pos != residue_uniprot_map[seq_id]:
+                        _log("ERR",
+                             f"{ts}\t{uid}\tconflicting_sifts\t"
+                             f"chain={chain_id},auth_seq_id={seq_id},"
+                             f"existing_pos={residue_uniprot_map[seq_id]},"
+                             f"new_pos={new_pos},pdb={pdb_id}\n")
+                        _abort = True
+                        break
+                except ValueError:
+                    pass
+            continue
+        seen_seq_ids.add(seq_id)
+
+        # 检查 SIFTS 标注是否指向 UniProt
         if db_name.upper() not in ("UNP", "UNIPROT", "UNIPROT_AC", ""):
             continue
         if db_num == "?" or db_num == "." or not db_num:
@@ -320,9 +337,12 @@ def process_one_protein(args_tuple: Tuple) -> Tuple[str, List[dict], List[str]]:
         try:
             uniprot_pos = int(db_num) - 1  # 转 0-based
             if unp_start - 1 <= uniprot_pos <= unp_end - 1:
-                residue_uniprot_map[key] = uniprot_pos
+                residue_uniprot_map[seq_id] = uniprot_pos
         except ValueError:
             continue
+
+    if _abort:
+        return uid, [], logs
 
     if not residue_uniprot_map:
         _log("ERR", f"{ts}\t{uid}\tno_mapped_residues\tchain={chain_id}, pdb={pdb_id}\n")
@@ -434,7 +454,9 @@ def process_one_protein(args_tuple: Tuple) -> Tuple[str, List[dict], List[str]]:
     residue_data: List[dict] = []
 
     for fs_chain_id, residues in areas.items():
-        # FreeSASA 可能重映射了链ID, 尝试匹配
+        # 只处理目标链 (多链时 auth_seq_id 可能重复)
+        if fs_chain_id != chain_id:
+            continue
         for res_key, res_area in residues.items():
             resn = getattr(res_area, "residueType", "")
             resi = getattr(res_area, "residueNumber", str(res_key))
@@ -449,14 +471,8 @@ def process_one_protein(args_tuple: Tuple) -> Tuple[str, List[dict], List[str]]:
             if resn in SKIP_RESIDUES:
                 continue
 
-            # 查 UniProt 位置
-            # FreeSASA 用的链ID可能和原始CIF不同, 尝试多种匹配
-            uniprot_pos = None
-            for try_chain in (chain_id, fs_chain_id):
-                key = (try_chain, resi)
-                if key in residue_uniprot_map:
-                    uniprot_pos = residue_uniprot_map[key]
-                    break
+            # 查 UniProt 位置 (直接用 auth_seq_id 查映射表)
+            uniprot_pos = residue_uniprot_map.get(resi)
 
             if uniprot_pos is None:
                 continue  # 无法映射到 UniProt, 跳过
