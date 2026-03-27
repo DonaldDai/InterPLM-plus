@@ -340,6 +340,60 @@ def process_one_protein(args_tuple: Tuple) -> Tuple[str, List[dict], List[str]]:
                 _log("ERR", f"{ts}\t{uid}\tno_models\tpdb={pdb_id}\n")
                 return uid, [], logs
 
+            model = bio_struct[0]
+
+            # 检查过滤后原子数是否超过 PDB 格式上限 (99999)
+            PDB_ATOM_LIMIT = 99999
+            _sel = ProteinSelect()
+
+            atom_count = sum(
+                1 for chain in model for res in chain
+                if _sel.accept_residue(res)
+                for atom in res if _sel.accept_atom(atom)
+            )
+
+            if atom_count > PDB_ATOM_LIMIT:
+                # 只保留目标链, 移除其他链
+                remove_ids = [c.id for c in model if c.id != chain_id]
+                for cid in remove_ids:
+                    try:
+                        model.detach_child(cid)
+                    except Exception:
+                        pass
+
+                # 重新计数目标链
+                atom_count = sum(
+                    1 for chain in model for res in chain
+                    if _sel.accept_residue(res)
+                    for atom in res if _sel.accept_atom(atom)
+                )
+
+                # 如果单链仍超限, 从尾部截断残基
+                if atom_count > PDB_ATOM_LIMIT:
+                    target_chain = model[chain_id] if chain_id in model else None
+                    if target_chain:
+                        residues_list = [r for r in target_chain
+                                         if _sel.accept_residue(r)]
+                        cumul = 0
+                        cut_idx = len(residues_list)
+                        for i, res in enumerate(residues_list):
+                            n_atoms = sum(1 for a in res if _sel.accept_atom(a))
+                            cumul += n_atoms
+                            if cumul > PDB_ATOM_LIMIT:
+                                cut_idx = i
+                                break
+                        # 移除 cut_idx 之后的残基
+                        for res in residues_list[cut_idx:]:
+                            try:
+                                target_chain.detach_child(res.id)
+                            except Exception:
+                                pass
+
+                _log("PROC",
+                     f"{ts}\t{uid}\tatom_truncated\t"
+                     f"original={atom_count},limit={PDB_ATOM_LIMIT},"
+                     f"removed_chains={len(remove_ids)}\n")
+
             io = PDBIO()
             io.set_structure(bio_struct)
             io.save(str(tmp_pdb), select=ProteinSelect())
