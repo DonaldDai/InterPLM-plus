@@ -105,6 +105,7 @@ STANDARD_AA_SET = set(MAX_ASA.keys())
 # 默认超参
 DEFAULT_WORKERS = 4
 DEFAULT_REQUEST_DELAY = 0.15
+WORKER_TIMEOUT = 1800  # 30分钟超时
 
 
 # ============================================================
@@ -274,7 +275,7 @@ def process_one_protein(args_tuple: Tuple) -> Tuple[str, List[dict], List[str]]:
     # 增强型 CIF 中 _atom_site.pdbx_sifts_xref_db_num 包含 UniProt 序列位置
     try:
         auth_asym_ids = mmcif_dict.get("_atom_site.auth_asym_id", [])
-        label_seq_ids = mmcif_dict.get("_atom_site.label_seq_id", [])
+        auth_seq_ids = mmcif_dict.get("_atom_site.auth_seq_id", [])
         label_comp_ids = mmcif_dict.get("_atom_site.label_comp_id", [])
         sifts_db_nums = mmcif_dict.get("_atom_site.pdbx_sifts_xref_db_num", [])
         sifts_db_names = mmcif_dict.get("_atom_site.pdbx_sifts_xref_db_name", [])
@@ -288,9 +289,10 @@ def process_one_protein(args_tuple: Tuple) -> Tuple[str, List[dict], List[str]]:
         _log("ERR", f"{ts}\t{uid}\tcif_field_error\t{type(e).__name__}: {e}\n")
         return uid, [], logs
 
-    # 构建 (chain, label_seq_id) → uniprot_pos 映射
-    # 只取 ATOM 行, 目标链, UniProt 标注
-    residue_uniprot_map: Dict[Tuple[str, str], int] = {}  # (chain, label_seq_id) → uniprot_pos
+    # 构建 (chain, auth_seq_id) → uniprot_pos 映射
+    # FreeSASA 通过 BioPython PDBIO 导出的 PDB 使用 auth 编号,
+    # 所以 key 必须用 auth_seq_id 才能和 FreeSASA 的 residueNumber 对齐
+    residue_uniprot_map: Dict[Tuple[str, str], int] = {}  # (chain, auth_seq_id) → uniprot_pos
     seen_residues: Set[Tuple[str, str]] = set()
 
     for i in range(len(auth_asym_ids)):
@@ -300,7 +302,7 @@ def process_one_protein(args_tuple: Tuple) -> Tuple[str, List[dict], List[str]]:
         if chain != chain_id:
             continue
 
-        seq_id = label_seq_ids[i]
+        seq_id = auth_seq_ids[i]  # auth_seq_id — 和 FreeSASA 输出一致
         key = (chain, seq_id)
         if key in seen_residues:
             continue
@@ -485,6 +487,24 @@ def process_one_protein(args_tuple: Tuple) -> Tuple[str, List[dict], List[str]]:
 
 
 # ============================================================
+# 超时包装
+# ============================================================
+def _process_with_timeout(args_tuple: Tuple) -> Tuple[str, List[dict], List[str]]:
+    """在子进程内用线程执行, 超时返回空结果 + error log"""
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+    uid = args_tuple[0]
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(process_one_protein, args_tuple)
+        try:
+            return future.result(timeout=WORKER_TIMEOUT)
+        except FuturesTimeout:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            return uid, [], [
+                f"ERR\t{ts}\t{uid}\ttimeout\texceeded {WORKER_TIMEOUT}s\n"
+            ]
+
+
+# ============================================================
 # 主流程
 # ============================================================
 def main():
@@ -576,7 +596,7 @@ def main():
     ctx = multiprocessing.get_context("spawn")
     with ctx.Pool(processes=args.workers) as pool:
         for uid, residue_data, log_lines in pool.imap_unordered(
-                process_one_protein, tasks, chunksize=1):
+                _process_with_timeout, tasks, chunksize=1):
 
             n_done += 1
 
