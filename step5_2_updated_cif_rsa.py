@@ -226,23 +226,22 @@ def process_one_protein(args_tuple: Tuple) -> Tuple[str, List[dict], List[str]]:
             break
 
     if best is None:
-        n_structs = len(structures)
-        # 记录最佳候选的覆盖信息
-        top = structures[0]
-        top_cov = top.get("unp_end", 0) - top.get("unp_start", 0) + 1
+        # 无全覆盖, 取第一个 (API 已按质量排序)
+        best = structures[0]
+        top_cov = best.get("unp_end", 0) - best.get("unp_start", 0) + 1
         _log("BEST",
-             f"{ts}\t{uid}\tno_full_coverage\t{n_structs}\t"
-             f"best_pdb={top.get('pdb_id','')},cov={top_cov}/{seq_len}\t\n")
-        return uid, [], logs
+             f"{ts}\t{uid}\tpartial_coverage\t{len(structures)}\t"
+             f"best_pdb={best.get('pdb_id','')},cov={top_cov}/{seq_len}\t\n")
+    else:
+        _log("BEST",
+             f"{ts}\t{uid}\tselected\t{len(structures)}\t"
+             f"pdb={best['pdb_id']},chain={best['chain_id']},"
+             f"range={best['unp_start']}-{best['unp_end']}\t\n")
 
     pdb_id = best["pdb_id"]
     chain_id = best["chain_id"]
     unp_start = best["unp_start"]
     unp_end = best["unp_end"]
-
-    _log("BEST",
-         f"{ts}\t{uid}\tselected\t{len(structures)}\t"
-         f"pdb={pdb_id},chain={chain_id},range={unp_start}-{unp_end}\t\n")
 
     # ---- 3. 下载增强型 CIF ----
     cif_path = cif_dir / f"{pdb_id}_updated.cif"
@@ -516,7 +515,7 @@ def main():
     n_done = 0
     n_success = 0
     n_fail = 0
-    n_no_coverage = 0
+    n_no_structure = 0
     rsa_buf: List[str] = []
     FLUSH_EVERY = 20
 
@@ -546,11 +545,10 @@ def main():
                         f"{rd['sasa']}\t{rd['max_asa']}\t{rd['rsa']}\n")
                 n_success += 1
             else:
-                # 判断是 no_coverage 还是其他失败
-                has_no_cov = any("no_full_coverage" in e or "no_structures" in e
-                                 or "empty_response" in e for e in log_lines)
-                if has_no_cov:
-                    n_no_coverage += 1
+                has_no_struct = any("no_structures" in e or "empty_response" in e
+                                    for e in log_lines)
+                if has_no_struct:
+                    n_no_structure += 1
                 else:
                     n_fail += 1
 
@@ -564,7 +562,7 @@ def main():
                 elapsed = time.time() - t0
                 rate = n_done / elapsed if elapsed > 0 else 0
                 print(f"  [{n_done:>6}/{len(tasks)}] "
-                      f"success={n_success} no_coverage={n_no_coverage} "
+                      f"success={n_success} no_structure={n_no_structure} "
                       f"fail={n_fail} ({rate:.1f} prot/s)")
 
     # flush 残留
@@ -575,7 +573,7 @@ def main():
     elapsed_total = time.time() - t0
     proc_log.print_and_write("main", "done",
         f"elapsed={elapsed_total:.1f}s, success={n_success}, "
-        f"no_coverage={n_no_coverage}, fail={n_fail}")
+        f"no_structure={n_no_structure}, fail={n_fail}")
 
     # 摘要
     total_lines = 0
@@ -588,8 +586,8 @@ def main():
     print("=" * 60)
     print(f"  UniProt IDs:      {len(seq_lens)}")
     print(f"  已完成(含断点):   {len(done_uids) + n_success}")
-    print(f"  本次成功:         {n_success}")
-    print(f"  无全覆盖结构:     {n_no_coverage}")
+    print(f"  本次成功:         {n_success} (含部分覆盖)")
+    print(f"  无PDBe结构:       {n_no_structure}")
     print(f"  失败(其他):       {n_fail}")
     print(f"  总残基数:         {total_lines}")
     print(f"  耗时:             {elapsed_total:.1f}s")
