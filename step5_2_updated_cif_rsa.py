@@ -106,6 +106,7 @@ STANDARD_AA_SET = set(MAX_ASA.keys())
 DEFAULT_WORKERS = 4
 DEFAULT_REQUEST_DELAY = 0.15
 WORKER_TIMEOUT = 1800  # 30分钟超时
+WORKER_MEMORY_LIMIT = 4 * 1024 * 1024 * 1024  # 4GB 虚拟内存上限 (bytes)
 
 
 # ============================================================
@@ -503,10 +504,23 @@ def process_one_protein(args_tuple: Tuple) -> Tuple[str, List[dict], List[str]]:
 
 
 # ============================================================
-# 超时包装
+# 子进程初始化: 设置内存上限
+# ============================================================
+def _worker_init():
+    """在每个 Pool worker 启动时设置虚拟内存上限"""
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_AS,
+                           (WORKER_MEMORY_LIMIT, WORKER_MEMORY_LIMIT))
+    except (ImportError, ValueError, resource.error):
+        pass  # Windows 或无权限时静默跳过
+
+
+# ============================================================
+# 超时 + 内存保护包装
 # ============================================================
 def _process_with_timeout(args_tuple: Tuple) -> Tuple[str, List[dict], List[str]]:
-    """在子进程内用线程执行, 超时返回空结果 + error log"""
+    """在子进程内用线程执行, 超时或OOM返回空结果 + error log"""
     from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
     uid = args_tuple[0]
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -517,6 +531,17 @@ def _process_with_timeout(args_tuple: Tuple) -> Tuple[str, List[dict], List[str]
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             return uid, [], [
                 f"ERR\t{ts}\t{uid}\ttimeout\texceeded {WORKER_TIMEOUT}s\n"
+            ]
+        except MemoryError:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            return uid, [], [
+                f"ERR\t{ts}\t{uid}\toom\t"
+                f"exceeded memory limit {WORKER_MEMORY_LIMIT // (1024**3)}GB\n"
+            ]
+        except Exception as e:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            return uid, [], [
+                f"ERR\t{ts}\t{uid}\tworker_crash\t{type(e).__name__}: {e}\n"
             ]
 
 
@@ -610,7 +635,7 @@ def main():
     FLUSH_EVERY = 20
 
     ctx = multiprocessing.get_context("spawn")
-    with ctx.Pool(processes=args.workers) as pool:
+    with ctx.Pool(processes=args.workers, initializer=_worker_init) as pool:
         for uid, residue_data, log_lines in pool.imap_unordered(
                 _process_with_timeout, tasks, chunksize=1):
 
