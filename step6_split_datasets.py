@@ -61,7 +61,11 @@ OUTPUT_BASE = Path("cusdata/06_splits")
 # name → source TSV (第一列必须是 uniprot_id)
 FEATURES: Dict[str, Path] = {
     # "kd":  Path("cusdata/04_kd/kd_per_residue.tsv"),
-    "rsa": Path("cusdata/05_1_alphafold_rsa/rsa_per_residue.tsv"),
+    # "rsa": Path("cusdata/05_1_alphafold_rsa/rsa_per_residue.tsv"),
+    "rsa_af_90_100": Path("cusdata/05_1_alphafold_rsa/plddt_splits/plddt_90_100.tsv"),
+    "rsa_af_70_90": Path("cusdata/05_1_alphafold_rsa/plddt_splits/plddt_70_90.tsv"),
+    "rsa_af_50_70": Path("cusdata/05_1_alphafold_rsa/plddt_splits/plddt_50_70.tsv"),
+    "rsa_af_0_50": Path("cusdata/05_1_alphafold_rsa/plddt_splits/plddt_0_50.tsv"),
 }
 
 # CD-HIT 参数
