@@ -35,6 +35,7 @@ Step 6: Refer集 / 验证集划分 (多特征, 各自独立)
 
 import subprocess
 import sys
+import os
 import time
 import random
 import argparse
@@ -62,10 +63,12 @@ OUTPUT_BASE = Path("cusdata/06_splits")
 FEATURES: Dict[str, Path] = {
     # "kd":  Path("cusdata/04_kd/kd_per_residue.tsv"),
     # "rsa": Path("cusdata/05_1_alphafold_rsa/rsa_per_residue.tsv"),
-    "rsa_af_90_100": Path("cusdata/05_1_alphafold_rsa/plddt_splits/plddt_90_100.tsv"),
-    "rsa_af_70_90": Path("cusdata/05_1_alphafold_rsa/plddt_splits/plddt_70_90.tsv"),
-    "rsa_af_50_70": Path("cusdata/05_1_alphafold_rsa/plddt_splits/plddt_50_70.tsv"),
-    "rsa_af_0_50": Path("cusdata/05_1_alphafold_rsa/plddt_splits/plddt_0_50.tsv"),
+    "rsa_struct_split": Path("cusdata/05_1_alphafold_rsa/rsa_per_residue.tsv"),
+    # "rsa_af_90_100": Path("cusdata/05_1_alphafold_rsa/plddt_splits/plddt_90_100.tsv"),
+    # "rsa_af_70_90": Path("cusdata/05_1_alphafold_rsa/plddt_splits/plddt_70_90.tsv"),
+    # "rsa_af_50_70": Path("cusdata/05_1_alphafold_rsa/plddt_splits/plddt_50_70.tsv"),
+    # "rsa_af_0_50": Path("cusdata/05_1_alphafold_rsa/plddt_splits/plddt_0_50.tsv"),
+    # "rsa_updated_cif": Path("cusdata/05_2_updated_cif_rsa/rsa_per_residue.tsv"),
 }
 
 # CD-HIT 参数
@@ -73,6 +76,13 @@ CDHIT_IDENTITY = 0.90
 CDHIT_WORD_SIZE = 5
 CDHIT_THREADS = 8
 CDHIT_MEMORY = 16000
+
+# Foldseek 参数
+FOLDSEEK_COV = 0.8          # coverage threshold
+FOLDSEEK_COV_MODE = 0       # coverage mode (0=query+target)
+FOLDSEEK_THREADS = 8
+AF_STRUCT_DIR = Path("cusdata/05_1_alphafold_rsa/af_structures")
+DEFAULT_CLUSTER_METHOD = "foldseek"  # "cdhit" or "foldseek"
 
 # 拆分比例
 VAL_RATIO = 0.15
@@ -241,6 +251,132 @@ def run_cdhit(
                f"max_size={max(sizes)}, min_size={min(sizes)}, "
                f"median_size={sorted(sizes)[len(sizes)//2]}, "
                f"singletons={sum(1 for s in sizes if s == 1)}")
+
+    return clusters, representatives
+
+
+# ============================================================
+# Step 6.2b: Foldseek 结构聚类 (替代 CD-HIT)
+# ============================================================
+def run_foldseek(
+    input_fasta: Path,
+    output_prefix: Path,
+    kept_uids: Set[str],
+    logger: StepLogger,
+) -> Tuple[Dict[int, List[str]], Dict[int, str]]:
+    """
+    用 Foldseek easy-cluster 进行结构聚类
+
+    需要 AlphaFold 结构文件在 AF_STRUCT_DIR 下
+
+    返回格式与 run_cdhit 相同:
+      clusters:       {cluster_id: [seq_id, ...]}
+      representatives: {cluster_id: representative_seq_id}
+    """
+    import shutil
+    import tempfile
+
+    logger.log("6.2_foldseek", "start",
+               f"cov={FOLDSEEK_COV}, cov_mode={FOLDSEEK_COV_MODE}, "
+               f"struct_dir={AF_STRUCT_DIR}")
+
+    if not AF_STRUCT_DIR.exists():
+        logger.log("6.2_foldseek", "error",
+                   f"结构目录不存在: {AF_STRUCT_DIR}")
+        print(f"ERROR: 结构目录不存在: {AF_STRUCT_DIR}")
+        sys.exit(1)
+
+    # 创建临时目录, 只放有对应结构的 uid 的 symlink
+    tmp_input = Path(f"{output_prefix}_foldseek_input")
+    tmp_work = Path(f"{output_prefix}_foldseek_tmp")
+    tmp_input.mkdir(parents=True, exist_ok=True)
+    tmp_work.mkdir(parents=True, exist_ok=True)
+
+    n_linked = 0
+    n_missing = 0
+    for uid in kept_uids:
+        cif = AF_STRUCT_DIR / f"AF-{uid}-F1-model_v6.cif"
+        link = tmp_input / f"AF-{uid}-F1-model_v6.cif"
+        if cif.exists():
+            if not link.exists():
+                os.symlink(cif.resolve(), link)
+            n_linked += 1
+        else:
+            n_missing += 1
+
+    logger.log("6.2_foldseek", "structures",
+               f"linked={n_linked}, missing={n_missing}")
+
+    if n_linked == 0:
+        logger.log("6.2_foldseek", "error", "0 structures found")
+        print("ERROR: Foldseek 没有可用的结构文件")
+        sys.exit(1)
+
+    # 运行 foldseek easy-cluster
+    cmd = [
+        "foldseek", "easy-cluster",
+        str(tmp_input),
+        str(output_prefix),
+        str(tmp_work),
+        "-c", str(FOLDSEEK_COV),
+        "--cov-mode", str(FOLDSEEK_COV_MODE),
+        "--threads", str(FOLDSEEK_THREADS),
+    ]
+
+    logger.log("6.2_foldseek", "cmd", " ".join(cmd))
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        logger.log("6.2_foldseek", "error", result.stderr[:500])
+        print(f"ERROR: Foldseek failed\n{result.stderr}")
+        sys.exit(1)
+
+    # 解析 _cluster.tsv: 两列 (representative\tmember)
+    cluster_tsv = Path(f"{output_prefix}_cluster.tsv")
+    if not cluster_tsv.exists():
+        logger.log("6.2_foldseek", "error",
+                   f"输出文件不存在: {cluster_tsv}")
+        sys.exit(1)
+
+    def _fname_to_uid(fname: str) -> str:
+        """AF-P12345-F1-model_v4 → P12345"""
+        fname = fname.strip()
+        if fname.startswith("AF-") and "-F1-" in fname:
+            return fname.split("-")[1]
+        return fname
+
+    # 读取并组织成 clusters 字典
+    rep_to_members: Dict[str, List[str]] = defaultdict(list)
+    with open(cluster_tsv) as f:
+        for line in f:
+            parts = line.strip().split("\t")
+            if len(parts) < 2:
+                continue
+            rep_uid = _fname_to_uid(parts[0])
+            mem_uid = _fname_to_uid(parts[1])
+            rep_to_members[rep_uid].append(mem_uid)
+
+    clusters: Dict[int, List[str]] = {}
+    representatives: Dict[int, str] = {}
+    for cid, (rep, members) in enumerate(rep_to_members.items()):
+        clusters[cid] = members
+        representatives[cid] = rep
+
+    n_clusters = len(clusters)
+    sizes = [len(v) for v in clusters.values()]
+
+    logger.log("6.2_foldseek", "done",
+               f"clusters={n_clusters}, sequences={sum(sizes)}, "
+               f"max_size={max(sizes)}, min_size={min(sizes)}, "
+               f"median_size={sorted(sizes)[len(sizes)//2]}, "
+               f"singletons={sum(1 for s in sizes if s == 1)}")
+
+    # 清理临时目录
+    try:
+        shutil.rmtree(tmp_input)
+        shutil.rmtree(tmp_work)
+    except OSError:
+        pass
 
     return clusters, representatives
 
@@ -425,6 +561,9 @@ def main():
                         help=f"验证集比例 (默认: {VAL_RATIO})")
     parser.add_argument("--seed", type=int, default=RANDOM_SEED,
                         help=f"随机种子 (默认: {RANDOM_SEED})")
+    parser.add_argument("--cluster-method", type=str, default=DEFAULT_CLUSTER_METHOD,
+                        choices=["cdhit", "foldseek"],
+                        help=f"聚类方法 (默认: {DEFAULT_CLUSTER_METHOD})")
     parser.add_argument("--whitelist-file", type=str, default=None,
                         help="白名单文件 (每行一个UniProt ID, 强制放入验证集). "
                              "不指定则使用内置的人类TLR1-10列表")
@@ -468,6 +607,7 @@ def main():
     print("=" * 60)
     print("Step 6: Refer集 / 验证集划分")
     print(f"  特征:      {list(enabled.keys())}")
+    print(f"  聚类方法:  {args.cluster_method}")
     print(f"  val_ratio: {args.val_ratio}, seed: {args.seed}")
     print(f"  whitelist: {len(whitelist)} IDs → 强制验证集")
     print("=" * 60)
@@ -486,6 +626,7 @@ def main():
         logger = StepLogger(feat_dir / "split_log.tsv")
         logger.log("main", "start",
                    f"feature={feat_name}, source={feat_file}, "
+                   f"cluster_method={args.cluster_method}, "
                    f"val_ratio={args.val_ratio}, seed={args.seed}, "
                    f"whitelist_size={len(whitelist)}")
         t0 = time.time()
@@ -499,10 +640,15 @@ def main():
             logger.log("main", "abort", "0 proteins after filtering")
             continue
 
-        # ---- 6.2 CD-HIT聚类 ----
-        print("\n--- 6.2 CD-HIT聚类 ---")
-        cdhit_prefix = feat_dir / "cdhit_id90"
-        clusters, representatives = run_cdhit(filtered_fasta, cdhit_prefix, logger)
+        # ---- 6.2 聚类 ----
+        print(f"\n--- 6.2 聚类 ({args.cluster_method}) ---")
+        if args.cluster_method == "foldseek":
+            foldseek_prefix = feat_dir / "foldseek"
+            clusters, representatives = run_foldseek(
+                filtered_fasta, foldseek_prefix, kept_uids, logger)
+        else:
+            cdhit_prefix = feat_dir / "cdhit_id90"
+            clusters, representatives = run_cdhit(filtered_fasta, cdhit_prefix, logger)
 
         # ---- 6.3 拆分 ----
         print("\n--- 6.3 拆分refer/val ---")
