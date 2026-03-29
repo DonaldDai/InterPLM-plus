@@ -643,12 +643,12 @@ def main():
         # ---- 6.2 聚类 ----
         print(f"\n--- 6.2 聚类 ({args.cluster_method}) ---")
         if args.cluster_method == "foldseek":
-            foldseek_prefix = feat_dir / "foldseek"
+            cluster_prefix = feat_dir / "foldseek"
             clusters, representatives = run_foldseek(
-                filtered_fasta, foldseek_prefix, kept_uids, logger)
+                filtered_fasta, cluster_prefix, kept_uids, logger)
         else:
-            cdhit_prefix = feat_dir / "cdhit_id90"
-            clusters, representatives = run_cdhit(filtered_fasta, cdhit_prefix, logger)
+            cluster_prefix = feat_dir / "cdhit_id90"
+            clusters, representatives = run_cdhit(filtered_fasta, cluster_prefix, logger)
 
         # ---- 6.3 拆分 ----
         print("\n--- 6.3 拆分refer/val ---")
@@ -691,7 +691,7 @@ def main():
         print(f"    耗时:       {elapsed:.1f}s")
 
         print(f"\n    输出文件:")
-        for fp in [filtered_fasta, cdhit_prefix, refer_ids_file, val_ids_file,
+        for fp in [filtered_fasta, cluster_prefix, refer_ids_file, val_ids_file,
                    feat_dir / "refer.tsv", feat_dir / "val.tsv",
                    feat_dir / "split_log.tsv"]:
             if fp.exists():
