@@ -63,12 +63,12 @@ OUTPUT_BASE = Path("cusdata/06_splits")
 FEATURES: Dict[str, Path] = {
     # "kd":  Path("cusdata/04_kd/kd_per_residue.tsv"),
     # "rsa": Path("cusdata/05_1_alphafold_rsa/rsa_per_residue.tsv"),
-    "rsa_struct_split": Path("cusdata/05_1_alphafold_rsa/rsa_per_residue.tsv"),
     # "rsa_af_90_100": Path("cusdata/05_1_alphafold_rsa/plddt_splits/plddt_90_100.tsv"),
     # "rsa_af_70_90": Path("cusdata/05_1_alphafold_rsa/plddt_splits/plddt_70_90.tsv"),
     # "rsa_af_50_70": Path("cusdata/05_1_alphafold_rsa/plddt_splits/plddt_50_70.tsv"),
     # "rsa_af_0_50": Path("cusdata/05_1_alphafold_rsa/plddt_splits/plddt_0_50.tsv"),
     # "rsa_updated_cif": Path("cusdata/05_2_updated_cif_rsa/rsa_per_residue.tsv"),
+    "rsa_struct_split": Path("cusdata/05_1_alphafold_rsa/rsa_per_residue.tsv"),
 }
 
 # CD-HIT 参数
@@ -447,17 +447,24 @@ def split_by_clusters(
     refer_cluster_ids = set(remaining_cluster_ids[n_random_val:])
     val_cluster_ids = forced_val_clusters | random_val_clusters
 
-    # ---- 第三步: 收集序列ID ----
+    # ---- 第三步: 只取每个cluster的代表蛋白 ----
     refer_uids: Set[str] = set()
     val_uids: Set[str] = set()
 
     for cid in refer_cluster_ids:
-        for sid in clusters[cid]:
-            refer_uids.add(extract_uid(sid))
+        rep = representatives.get(cid)
+        if rep:
+            refer_uids.add(extract_uid(rep))
 
     for cid in val_cluster_ids:
-        for sid in clusters[cid]:
-            val_uids.add(extract_uid(sid))
+        rep = representatives.get(cid)
+        if rep:
+            val_uids.add(extract_uid(rep))
+
+    # 白名单蛋白即使不是代表也要强制加入 val
+    for uid in whitelist_found:
+        if uid not in refer_uids:
+            val_uids.add(uid)
 
     logger.log("6.3_split", "done",
                f"refer_clusters={len(refer_cluster_ids)}, "
